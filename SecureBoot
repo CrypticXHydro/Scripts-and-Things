@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Secure Boot Installation Script
+# Secure Boot Installation Script with rEFInd
 # Based on RyanTheTide's LinuxConfigurations with Secure Boot support
 
 set -e
@@ -29,6 +29,16 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Variables
+TARGET_DISK=""
+EFI_PARTITION=""
+ROOT_PARTITION=""
+SWAP_PARTITION=""
+USERNAME=""
+HOSTNAME=""
+TIMEZONE="America/New_York"
+LANGUAGE="en_US.UTF-8"
+
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -45,42 +55,228 @@ check_uefi() {
     fi
 }
 
-# Check if Secure Boot is available
-check_secure_boot_capability() {
-    if [[ -d /sys/firmware/efi ]]; then
-        if [[ -f /sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data ]]; then
-            local secure_boot_status=$(od -An -t u1 /sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data)
-            if [[ $secure_boot_status -eq 1 ]]; then
-                log_info "Secure Boot is enabled in firmware"
-                SECURE_BOOT_ENABLED=1
-            else
-                log_info "Secure Boot is available but not enabled in firmware"
-                SECURE_BOOT_ENABLED=0
-            fi
-            return 0
+# Get target disk
+get_target_disk() {
+    log_info "Available disks:"
+    lsblk -d -o NAME,SIZE,MODEL
+    echo ""
+    read -p "Enter the target disk (e.g., sda, nvme0n1): " TARGET_DISK
+    TARGET_DISK="/dev/${TARGET_DISK}"
+    
+    if [[ ! -b "$TARGET_DISK" ]]; then
+        log_error "Disk $TARGET_DISK does not exist"
+        exit 1
+    fi
+}
+
+# Partition the disk
+partition_disk() {
+    log_info "Partitioning disk $TARGET_DISK"
+    
+    # Check if disk already has partitions
+    if [[ $(lsblk -n -o NAME "$TARGET_DISK" | wc -l) -gt 1 ]]; then
+        log_warning "Disk $TARGET_DISK already has partitions"
+        read -p "Do you want to overwrite them? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_error "Aborting installation"
+            exit 1
         fi
     fi
-    log_warning "Secure Boot is not available on this system"
-    SECURE_BOOT_ENABLED=0
-    return 1
+    
+    # Create GPT partition table
+    parted -s "$TARGET_DISK" mklabel gpt
+    
+    # Create partitions
+    # EFI partition (500MB)
+    parted -s "$TARGET_DISK" mkpart primary fat32 1MiB 501MiB
+    parted -s "$TARGET_DISK" set 1 esp on
+    EFI_PARTITION="${TARGET_DISK}1"
+    if [[ "$TARGET_DISK" == *"nvme"* ]]; then
+        EFI_PARTITION="${TARGET_DISK}p1"
+    fi
+    
+    # Swap partition (size based on RAM)
+    RAM_SIZE=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    SWAP_SIZE=$((RAM_SIZE / 1000 + 1000)) # RAM size in GB + 1GB
+    parted -s "$TARGET_DISK" mkpart primary linux-swap 501MiB ${SWAP_SIZE}MiB
+    SWAP_PARTITION="${TARGET_DISK}2"
+    if [[ "$TARGET_DISK" == *"nvme"* ]]; then
+        SWAP_PARTITION="${TARGET_DISK}p2"
+    fi
+    
+    # Root partition (rest of disk)
+    parted -s "$TARGET_DISK" mkpart primary ext4 ${SWAP_SIZE}MiB 100%
+    ROOT_PARTITION="${TARGET_DISK}3"
+    if [[ "$TARGET_DISK" == *"nvme"* ]]; then
+        ROOT_PARTITION="${TARGET_DISK}p3"
+    fi
+    
+    log_success "Disk partitioned successfully"
+}
+
+# Format partitions
+format_partitions() {
+    log_info "Formatting partitions"
+    
+    # Format EFI partition
+    mkfs.fat -F32 "$EFI_PARTITION"
+    
+    # Format swap partition
+    mkswap "$SWAP_PARTITION"
+    swapon "$SWAP_PARTITION"
+    
+    # Format root partition
+    mkfs.ext4 "$ROOT_PARTITION"
+    
+    # Mount partitions
+    mount "$ROOT_PARTITION" /mnt
+    mkdir -p /mnt/boot/efi
+    mount "$EFI_PARTITION" /mnt/boot/efi
+    
+    log_success "Partitions formatted and mounted"
+}
+
+# Install base system
+install_base_system() {
+    log_info "Installing base system"
+    
+    # Update mirrorlist
+    pacman -Sy --noconfirm reflector
+    reflector --country US --latest 10 --sort rate --save /etc/pacman.d/mirrorlist
+    
+    # Install base system
+    pacstrap /mnt base base-devel linux linux-firmware
+    
+    # Generate fstab
+    genfstab -U /mnt >> /mnt/mnt/fstab
+    
+    log_success "Base system installed"
+}
+
+# Configure system
+configure_system() {
+    log_info "Configuring system"
+    
+    # Chroot into the new system
+    arch-chroot /mnt /bin/bash <<EOF
+    # Set timezone
+    ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+    hwclock --systohc
+    
+    # Localization
+    echo "$LANGUAGE UTF-8" >> /etc/locale.gen
+    locale-gen
+    echo "LANG=$LANGUAGE" > /etc/locale.conf
+    
+    # Network configuration
+    echo "$HOSTNAME" > /etc/hostname
+    cat > /etc/hosts << HOSTS_EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
+HOSTS_EOF
+    
+    # Set root password
+    echo "Set root password:"
+    passwd
+    
+    # Install additional packages
+    pacman -Sy --noconfirm \
+        sudo nano vim git curl wget openssh \
+        networkmanager network-manager-applet \
+        dialog mtools dosfstools \
+        refind-efi efibootmgr
+    
+    # Enable services
+    systemctl enable NetworkManager
+    
+    # Create user
+    useradd -m -G wheel -s /bin/bash "$USERNAME"
+    echo "Set password for $USERNAME:"
+    passwd "$USERNAME"
+    
+    # Configure sudo
+    echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
+    
+    # Install rEFInd
+    refind-install
+    
+    # Configure rEFInd
+    cat > /boot/efi/EFI/refind/refind.conf << REFIND_EOF
+timeout 5
+use_nvram false
+scan_all_linux_kernels true
+also_scan_dirs @/EFI/ubuntu,@/EFI/BOOT
+fold_linux_kernels false
+menuentry "Arch Linux" {
+    icon     /EFI/refind/icons/os_arch.png
+    volume   "Arch Linux"
+    loader   /vmlinuz-linux
+    initrd   /initramfs-linux.img
+    options  "root=PARTUUID=$(blkid -s PARTUUID -o value $ROOT_PARTITION) rw add_efi_memmap"
+}
+menuentry "Windows Boot Manager" {
+    icon     /EFI/refind/icons/os_win.png
+    volume   "Windows Boot Manager"
+    loader   /EFI/Microsoft/Boot/bootmgfw.efi
+}
+REFIND_EOF
+    
+    # Generate initramfs
+    mkinitcpio -P
+    
+    # Install microcode
+    if grep -q "Intel" /proc/cpuinfo; then
+        pacman -S --noconfirm intel-ucode
+    elif grep -q "AMD" /proc/cpuinfo; then
+        pacman -S --noconfirm amd-ucode
+    fi
+    
+    # Update rEFInd config with microcode
+    if [ -f /boot/intel-ucode.img ]; then
+        sed -i 's/initrd   \/initramfs-linux.img/initrd   \/intel-ucode.img\n    initrd   \/initramfs-linux.img/' /boot/efi/EFI/refind/refind.conf
+    elif [ -f /boot/amd-ucode.img ]; then
+        sed -i 's/initrd   \/initramfs-linux.img/initrd   \/amd-ucode.img\n    initrd   \/initramfs-linux.img/' /boot/efi/EFI/refind/refind.conf
+    fi
+EOF
+    
+    log_success "System configured"
+}
+
+# Install desktop environment
+install_desktop() {
+    log_info "Installing desktop environment"
+    
+    arch-chroot /mnt /bin/bash <<EOF
+    # Install KDE Plasma
+    pacman -Sy --noconfirm \
+        plasma-meta plasma-desktop sddm \
+        konsole dolphin kate \
+        firefox vlc \
+        noto-fonts noto-fonts-cjk noto-fonts-emoji \
+        ttf-dejavu ttf-liberation
+    
+    # Enable display manager
+    systemctl enable sddm
+    
+    # Install additional applications
+    pacman -Sy --noconfirm \
+        libreoffice-still gimp inkscape \
+        audacity handbrake \
+        steam wine-staging
+EOF
+    
+    log_success "Desktop environment installed"
 }
 
 # Install required packages for Secure Boot
 install_secure_boot_packages() {
     log_info "Installing Secure Boot packages..."
     
-    # Determine package manager
-    if command -v apt >/dev/null 2>&1; then
-        apt update
-        apt install -y efibootmgr shim-signed grub-efi-amd64-signed sbsigntool efitools
-    elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm efibootmgr sbsigntool efitools
-    elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y efibootmgr shim-x64 grub2-efi-x64 grub2-efi-x64-modules sbsigntool efitools
-    else
-        log_error "Unsupported package manager"
-        return 1
-    fi
+    arch-chroot /mnt /bin/bash <<EOF
+    pacman -Sy --noconfirm sbsigntools efitools
+EOF
     
     log_success "Secure Boot packages installed"
 }
@@ -89,101 +285,58 @@ install_secure_boot_packages() {
 generate_secure_boot_keys() {
     log_info "Generating Secure Boot keys..."
     
+    arch-chroot /mnt /bin/bash <<EOF
     # Create directory for keys
     local key_dir="/etc/secureboot/keys"
-    mkdir -p "$key_dir"
+    mkdir -p "\$key_dir"
     
     # Generate Platform Key (PK)
-    openssl req -newkey rsa:4096 -nodes -keyout "${key_dir}/PK.key" \
-        -new -x509 -sha256 -days 3650 -out "${key_dir}/PK.crt" \
+    openssl req -newkey rsa:4096 -nodes -keyout "\${key_dir}/PK.key" \
+        -new -x509 -sha256 -days 3650 -out "\${key_dir}/PK.crt" \
         -subj "/CN=Platform Key/"
     
     # Generate Key Exchange Key (KEK)
-    openssl req -newkey rsa:4096 -nodes -keyout "${key_dir}/KEK.key" \
-        -new -x509 -sha256 -days 3650 -out "${key_dir}/KEK.crt" \
+    openssl req -newkey rsa:4096 -nodes -keyout "\${key_dir}/KEK.key" \
+        -new -x509 -sha256 -days 3650 -out "\${key_dir}/KEK.crt" \
         -subj "/CN=Key Exchange Key/"
     
     # Generate Signature Database (db) key
-    openssl req -newkey rsa:4096 -nodes -keyout "${key_dir}/db.key" \
-        -new -x509 -sha256 -days 3650 -out "${key_dir}/db.crt" \
+    openssl req -newkey rsa:4096 -nodes -keyout "\${key_dir}/db.key" \
+        -new -x509 -sha256 -days 3650 -out "\${key_dir}/db.crt" \
         -subj "/CN=Signature Database key/"
+EOF
     
     log_success "Secure Boot keys generated"
-}
-
-# Install keys to EFI
-install_secure_boot_keys() {
-    log_info "Installing Secure Boot keys to EFI..."
-    
-    local key_dir="/etc/secureboot/keys"
-    
-    # Convert certificates to ESL format
-    cert-to-efi-sig-list -g "$(uuidgen)" "${key_dir}/PK.crt" "${key_dir}/PK.esl"
-    cert-to-efi-sig-list -g "$(uuidgen)" "${key_dir}/KEK.crt" "${key_dir}/KEK.esl"
-    cert-to-efi-sig-list -g "$(uuidgen)" "${key_dir}/db.crt" "${key_dir}/db.esl"
-    
-    # Sign the ESL files
-    sign-efi-sig-list -g "$(uuidgen)" -k "${key_dir}/PK.key" -c "${key_dir}/PK.crt" PK "${key_dir}/PK.esl"
-    sign-efi-sig-list -g "$(uuidgen)" -k "${key_dir}/PK.key" -c "${key_dir}/PK.crt" KEK "${key_dir}/KEK.esl"
-    sign-efi-sig-list -g "$(uuidgen)" -k "${key_dir}/PK.key" -c "${key_dir}/PK.crt" db "${key_dir}/db.esl"
-    
-    # Copy keys to EFI partition
-    local efi_dir="/boot/efi"
-    local keys_dir="${efi_dir}/EFI/keys"
-    
-    mkdir -p "$keys_dir"
-    cp "${key_dir}/PK.auth" "$keys_dir"
-    cp "${key_dir}/KEK.auth" "$keys_dir"
-    cp "${key_dir}/db.auth" "$keys_dir"
-    
-    log_success "Secure Boot keys installed to EFI"
-}
-
-# Configure GRUB for Secure Boot
-configure_grub_secure_boot() {
-    log_info "Configuring GRUB for Secure Boot..."
-    
-    # Backup original GRUB configuration
-    cp /etc/default/grub /etc/default/grub.backup
-    
-    # Add Secure Boot options to GRUB configuration
-    if ! grep -q "GRUB_CMDLINE_LINUX.*=.*sb" /etc/default/grub; then
-        sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 quiet splash"/' /etc/default/grub
-    fi
-    
-    # Update GRUB
-    if command -v update-grub >/dev/null 2>&1; then
-        update-grub
-    elif command -v grub-mkconfig >/dev/null 2>&1; then
-        grub-mkconfig -o /boot/grub/grub.cfg
-    fi
-    
-    # Install GRUB for EFI
-    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck
-    
-    log_success "GRUB configured for Secure Boot"
 }
 
 # Sign EFI binaries
 sign_efi_binaries() {
     log_info "Signing EFI binaries..."
     
+    arch-chroot /mnt /bin/bash <<EOF
     local key_dir="/etc/secureboot/keys"
     local efi_dir="/boot/efi"
     
-    # Sign the GRUB EFI binary
-    if [[ -f "${efi_dir}/EFI/GRUB/grubx64.efi" ]]; then
-        sbsign --key "${key_dir}/db.key" --cert "${key_dir}/db.crt" \
-            --output "${efi_dir}/EFI/GRUB/grubx64.efi" "${efi_dir}/EFI/GRUB/grubx64.efi"
+    # Sign rEFInd
+    if [[ -f "\${efi_dir}/EFI/refind/refind_x64.efi" ]]; then
+        sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
+            --output "\${efi_dir}/EFI/refind/refind_x64.efi" "\${efi_dir}/EFI/refind/refind_x64.efi"
     fi
     
     # Sign the kernel
     for kernel in /boot/vmlinuz-*; do
-        if [[ -f "$kernel" ]]; then
-            sbsign --key "${key_dir}/db.key" --cert "${key_dir}/db.crt" \
-                --output "$kernel" "$kernel"
+        if [[ -f "\$kernel" ]]; then
+            sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
+                --output "\$kernel" "\$kernel"
         fi
     done
+    
+    # Sign the bootloader
+    if [[ -f "\${efi_dir}/EFI/BOOT/BOOTX64.EFI" ]]; then
+        sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
+            --output "\${efi_dir}/EFI/BOOT/BOOTX64.EFI" "\${efi_dir}/EFI/BOOT/BOOTX64.EFI"
+    fi
+EOF
     
     log_success "EFI binaries signed"
 }
@@ -192,26 +345,32 @@ sign_efi_binaries() {
 setup_automatic_signing() {
     log_info "Setting up automatic signing for future kernel updates..."
     
+    arch-chroot /mnt /bin/bash <<EOF
     local key_dir="/etc/secureboot/keys"
     
     # Create a hook for package managers to sign kernels
-    if command -v apt >/dev/null 2>&1; then
-        # For Debian/Ubuntu
-        local hook_dir="/etc/kernel/postinst.d"
-        local hook_file="${hook_dir}/zz-secureboot-sign"
-        
-        mkdir -p "$hook_dir"
-        cat > "$hook_file" << EOF
-#!/bin/bash
-for kernel in /boot/vmlinuz-*; do
-    if [[ -f "\$kernel" ]]; then
-        sbsign --key "${key_dir}/db.key" --cert "${key_dir}/db.crt" \\
-            --output "\$kernel" "\$kernel"
-    fi
-done
+    local hook_dir="/etc/pacman.d/hooks"
+    local hook_file="\${hook_dir}/999-sign-kernel-for-secureboot.hook"
+    
+    mkdir -p "\$hook_dir"
+    cat > "\$hook_file" << HOOK_EOF
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux
+Target = linux-*
+Target = systemd
+Target = systemd-*
+Target = efi-*
+
+[Action]
+Description = Signing EFI binaries for Secure Boot
+When = PostTransaction
+Exec = /usr/bin/sh -c '/usr/bin/find /boot -name "vmlinuz-*" -exec /usr/bin/sbsign --key \$key_dir/db.key --cert \$key_dir/db.crt --output {} {} \;'
+Exec = /usr/bin/sh -c '/usr/bin/sbsign --key \$key_dir/db.key --cert \$key_dir/db.crt --output /boot/efi/EFI/refind/refind_x64.efi /boot/efi/EFI/refind/refind_x64.efi'
+HOOK_EOF
 EOF
-        chmod +x "$hook_file"
-    fi
     
     log_success "Automatic signing setup complete"
 }
@@ -220,18 +379,10 @@ EOF
 setup_secure_boot() {
     log_info "Starting Secure Boot setup..."
     
-    check_root
     check_uefi
-    
-    if ! check_secure_boot_capability; then
-        log_warning "Secure Boot is not available on this system. Continuing with installation without Secure Boot."
-        return 0
-    fi
     
     install_secure_boot_packages
     generate_secure_boot_keys
-    install_secure_boot_keys
-    configure_grub_secure_boot
     sign_efi_binaries
     setup_automatic_signing
     
@@ -241,141 +392,68 @@ setup_secure_boot() {
     log_info "You need to copy the .auth files to a USB drive and enroll them in your BIOS"
 }
 
-# Function to install base system
-install_base_system() {
-    log_info "Starting base system installation..."
+# Get user input
+get_user_input() {
+    echo ""
+    log_info "Arch Linux Installation with Secure Boot and rEFInd"
+    echo ""
     
-    # Set timezone
-    ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime
-    hwclock --systohc
+    get_target_disk
     
-    # Localization
-    sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
-    locale-gen
-    echo "LANG=en_US.UTF-8" > /etc/locale.conf
+    read -p "Enter username: " USERNAME
+    read -p "Enter hostname: " HOSTNAME
     
-    # Network configuration
-    echo "arch" > /etc/hostname
-    cat > /etc/hosts << EOF
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   arch.localdomain arch
-EOF
+    echo ""
+    log_info "The following partitions will be created:"
+    log_info "1. EFI System Partition (500MB)"
+    log_info "2. Swap Partition (size based on RAM + 1GB)"
+    log_info "3. Root Partition (remaining space)"
+    echo ""
     
-    # Set root password
-    echo "Set root password:"
-    passwd
-    
-    # Install and configure bootloader
-    if command -v apt >/dev/null 2>&1; then
-        # Debian/Ubuntu
-        apt install -y grub-efi-amd64 efibootmgr
-        grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
-        update-grub
-    elif command -v pacman >/dev/null 2>&1; then
-        # Arch Linux
-        pacman -Sy --noconfirm grub efibootmgr
-        grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
-        grub-mkconfig -o /boot/grub/grub.cfg
-    elif command -v dnf >/dev/null 2>&1; then
-        # Fedora
-        dnf install -y grub2-efi-x64-modules shim-x64
-        grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
-        grub2-mkconfig -o /boot/grub2/grub.cfg
+    read -p "Continue with installation? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_error "Installation aborted by user"
+        exit 1
     fi
-    
-    log_success "Base system installation complete"
 }
 
-# Function to install desktop environment
-install_desktop_environment() {
-    log_info "Installing desktop environment..."
+# Main installation function
+main_installation() {
+    check_root
+    get_user_input
     
-    # Determine package manager and install appropriate desktop
-    if command -v apt >/dev/null 2>&1; then
-        # Debian/Ubuntu - install GNOME
-        apt install -y ubuntu-desktop
-    elif command -v pacman >/dev/null 2>&1; then
-        # Arch Linux - install KDE Plasma
-        pacman -Sy --noconfirm plasma-meta plasma-desktop sddm konsole
-        systemctl enable sddm
-    elif command -v dnf >/dev/null 2>&1; then
-        # Fedora - install GNOME
-        dnf groupinstall -y "Basic Desktop" "GNOME"
-        systemctl enable gdm
-    fi
+    log_info "Starting installation process..."
     
-    log_success "Desktop environment installation complete"
-}
-
-# Function to create user account
-create_user() {
-    log_info "Creating user account..."
+    # Installation steps
+    partition_disk
+    format_partitions
+    install_base_system
+    configure_system
+    install_desktop
     
-    # Create user with default settings
-    useradd -m -G wheel -s /bin/bash "$username"
-    echo "Set password for $username:"
-    passwd "$username"
+    # Secure Boot setup
+    setup_secure_boot
     
-    # Allow wheel group to use sudo
-    if command -v apt >/dev/null 2>&1; then
-        # Debian/Ubuntu
-        apt install -y sudo
-    fi
-    
-    # Enable sudo for wheel group
-    if ! grep -q "^%wheel" /etc/sudoers; then
-        echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
-    fi
-    
-    log_success "User account created"
-}
-
-# Main function
-main() {
-    log_info "Starting installation with Secure Boot support..."
-    
-    # Check if we're running on a live system or installed system
-    if [[ -f /etc/os-release ]]; then
-        # We're on an installed system, setup Secure Boot
-        setup_secure_boot
-    else
-        # We're on a live system, perform installation
-        check_root
-        
-        # Ask for username if not provided
-        if [[ -z "$username" ]]; then
-            read -p "Enter username: " username
-        fi
-        
-        # Install base system
-        install_base_system
-        
-        # Create user
-        create_user
-        
-        # Install desktop environment
-        install_desktop_environment
-        
-        # Setup Secure Boot
-        setup_secure_boot
-    fi
+    # Cleanup and final steps
+    log_info "Finalizing installation..."
+    umount -R /mnt
+    swapoff "$SWAP_PARTITION"
     
     log_success "Installation complete!"
-    log_warning "If you want to enable Secure Boot, remember to:"
-    log_warning "1. Reboot into your UEFI/BIOS settings"
-    log_warning "2. Enable Secure Boot"
-    log_warning "3. Enroll the keys from /etc/secureboot/keys/"
+    log_info "You can now reboot into your new system"
+    log_warning "Don't forget to:"
+    log_warning "1. Remove the installation media"
+    log_warning "2. Enable Secure Boot in your BIOS/UEFI settings"
+    log_warning "3. Enroll your Secure Boot keys"
 }
 
-# Parse command line arguments
-if [[ "$1" == "--chroot" ]]; then
-    username="$2"
-    main "$@"
+# Check if we're running on a live system
+if grep -q "Arch Linux" /etc/os-release 2>/dev/null; then
+    # We're on a live Arch system, proceed with installation
+    main_installation
 else
-    # Ask for username if not provided
-    if [[ -z "$username" ]]; then
-        read -p "Enter username: " username
-    fi
-    main
+    log_error "This script must be run from an Arch Linux live environment"
+    log_info "Please boot from an Arch Linux ISO and run this script"
+    exit 1
 fi
