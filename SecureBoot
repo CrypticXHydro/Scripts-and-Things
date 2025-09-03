@@ -38,6 +38,7 @@ USERNAME=""
 HOSTNAME=""
 TIMEZONE="America/New_York"
 LANGUAGE="en_US.UTF-8"
+KEY_DIR="/root/secureboot_keys"
 
 # Check if running as root
 check_root() {
@@ -154,124 +155,6 @@ install_base_system() {
     log_success "Base system installed"
 }
 
-# Configure system
-configure_system() {
-    log_info "Configuring system"
-    
-    # Chroot into the new system
-    arch-chroot /mnt /bin/bash <<EOF
-    # Set timezone
-    ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
-    hwclock --systohc
-    
-    # Localization
-    echo "$LANGUAGE UTF-8" >> /etc/locale.gen
-    locale-gen
-    echo "LANG=$LANGUAGE" > /etc/locale.conf
-    
-    # Network configuration
-    echo "$HOSTNAME" > /etc/hostname
-    cat > /etc/hosts << HOSTS_EOF
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
-HOSTS_EOF
-    
-    # Set root password
-    echo "Setting root password:"
-    passwd
-    
-    # Install additional packages
-    pacman -Sy --noconfirm \
-        sudo nano vim git curl wget openssh \
-        networkmanager network-manager-applet \
-        dialog mtools dosfstools \
-        refind-efi efibootmgr
-    
-    # Enable services
-    systemctl enable NetworkManager
-    
-    # Create user
-    useradd -m -G wheel -s /bin/bash "$USERNAME"
-    echo "Setting password for $USERNAME:"
-    passwd "$USERNAME"
-    
-    # Configure sudo
-    echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
-    
-    # Install and configure rEFInd
-    refind-install --usedefault /dev/disk/by-partuuid/$(blkid -s PARTUUID -o value $EFI_PARTITION)
-    
-    # Create rEFInd config directory if it doesn't exist
-    mkdir -p /boot/efi/EFI/refind/
-    
-    # Configure rEFInd
-    cat > /boot/efi/EFI/refind/refind.conf << REFIND_EOF
-timeout 5
-use_nvram false
-scan_all_linux_kernels true
-also_scan_dirs @/EFI/ubuntu,@/EFI/BOOT
-fold_linux_kernels false
-menuentry "Arch Linux" {
-    icon     /EFI/refind/icons/os_arch.png
-    volume   "Arch Linux"
-    loader   /vmlinuz-linux
-    initrd   /initramfs-linux.img
-    options  "root=PARTUUID=$(blkid -s PARTUUID -o value $ROOT_PARTITION) rw add_efi_memmap"
-}
-menuentry "Windows Boot Manager" {
-    icon     /EFI/refind/icons/os_win.png
-    volume   "Windows Boot Manager"
-    loader   /EFI/Microsoft/Boot/bootmgfw.efi
-}
-REFIND_EOF
-    
-    # Generate initramfs
-    mkinitcpio -P
-    
-    # Install microcode
-    if grep -q "Intel" /proc/cpuinfo; then
-        pacman -S --noconfirm intel-ucode
-    elif grep -q "AMD" /proc/cpuinfo; then
-        pacman -S --noconfirm amd-ucode
-    fi
-    
-    # Update rEFInd config with microcode
-    if [ -f /boot/intel-ucode.img ]; then
-        sed -i 's/initrd   \/initramfs-linux.img/initrd   \/intel-ucode.img\n    initrd   \/initramfs-linux.img/' /boot/efi/EFI/refind/refind.conf
-    elif [ -f /boot/amd-ucode.img ]; then
-        sed -i 's/initrd   \/initramfs-linux.img/initrd   \/amd-ucode.img\n    initrd   \/initramfs-linux.img/' /boot/efi/EFI/refind/refind.conf
-    fi
-EOF
-    
-    log_success "System configured"
-}
-
-# Install desktop environment
-install_desktop() {
-    log_info "Installing desktop environment"
-    
-    arch-chroot /mnt /bin/bash <<EOF
-    # Install KDE Plasma
-    pacman -Sy --noconfirm \
-        plasma-meta plasma-desktop sddm \
-        konsole dolphin kate \
-        firefox vlc \
-        noto-fonts noto-fonts-cjk noto-fonts-emoji \
-        ttf-dejavu ttf-liberation
-    
-    # Enable display manager
-    systemctl enable sddm
-    
-    # Install additional applications
-    pacman -Sy --noconfirm \
-        libreoffice-still gimp inkscape \
-        audacity handbrake
-EOF
-    
-    log_success "Desktop environment installed"
-}
-
 # Install required packages for Secure Boot
 install_secure_boot_packages() {
     log_info "Installing Secure Boot packages..."
@@ -283,32 +166,65 @@ EOF
     log_success "Secure Boot packages installed"
 }
 
-# Generate keys for Secure Boot
+# Generate keys for Secure Boot (in live environment)
 generate_secure_boot_keys() {
     log_info "Generating Secure Boot keys..."
     
-    arch-chroot /mnt /bin/bash <<EOF
     # Create directory for keys
-    key_dir="/etc/secureboot/keys"
-    mkdir -p "\$key_dir"
+    mkdir -p "$KEY_DIR"
     
     # Generate Platform Key (PK)
-    openssl req -newkey rsa:4096 -nodes -keyout "\${key_dir}/PK.key" \
-        -new -x509 -sha256 -days 3650 -out "\${key_dir}/PK.crt" \
+    openssl req -newkey rsa:4096 -nodes -keyout "${KEY_DIR}/PK.key" \
+        -new -x509 -sha256 -days 3650 -out "${KEY_DIR}/PK.crt" \
         -subj "/CN=Platform Key/"
     
     # Generate Key Exchange Key (KEK)
-    openssl req -newkey rsa:4096 -nodes -keyout "\${key_dir}/KEK.key" \
-        -new -x509 -sha256 -days 3650 -out "\${key_dir}/KEK.crt" \
+    openssl req -newkey rsa:4096 -nodes -keyout "${KEY_DIR}/KEK.key" \
+        -new -x509 -sha256 -days 3650 -out "${KEY_DIR}/KEK.crt" \
         -subj "/CN=Key Exchange Key/"
     
     # Generate Signature Database (db) key
-    openssl req -newkey rsa:4096 -nodes -keyout "\${key_dir}/db.key" \
-        -new -x509 -sha256 -days 3650 -out "\${key_dir}/db.crt" \
+    openssl req -newkey rsa:4096 -nodes -keyout "${KEY_DIR}/db.key" \
+        -new -x509 -sha256 -days 3650 -out "${KEY_DIR}/db.crt" \
         -subj "/CN=Signature Database key/"
+    
+    # Copy keys to installed system
+    mkdir -p /mnt/etc/secureboot/keys
+    cp -r "$KEY_DIR"/* /mnt/etc/secureboot/keys/
+    
+    log_success "Secure Boot keys generated and copied to installed system"
+}
+
+# Convert and sign ESL files
+convert_and_sign_esl() {
+    log_info "Converting and signing ESL files..."
+    
+    # Copy certificates to installed system for conversion
+    cp -r "$KEY_DIR" /mnt/tmp/secureboot_keys
+    
+    arch-chroot /mnt /bin/bash <<EOF
+    key_dir="/tmp/secureboot_keys"
+    
+    # Convert certificates to ESL format
+    cert-to-efi-sig-list -g "\$(uuidgen)" "\${key_dir}/PK.crt" "\${key_dir}/PK.esl"
+    cert-to-efi-sig-list -g "\$(uuidgen)" "\${key_dir}/KEK.crt" "\${key_dir}/KEK.esl"
+    cert-to-efi-sig-list -g "\$(uuidgen)" "\${key_dir}/db.crt" "\${key_dir}/db.esl"
+    
+    # Sign the ESL files
+    sign-efi-sig-list -g "\$(uuidgen)" -k "\${key_dir}/PK.key" -c "\${key_dir}/PK.crt" PK "\${key_dir}/PK.esl"
+    sign-efi-sig-list -g "\$(uuidgen)" -k "\${key_dir}/PK.key" -c "\${key_dir}/PK.crt" KEK "\${key_dir}/KEK.esl"
+    sign-efi-sig-list -g "\$(uuidgen)" -k "\${key_dir}/PK.key" -c "\${key_dir}/PK.crt" db "\${key_dir}/db.esl"
+    
+    # Copy auth files to permanent location
+    mkdir -p /etc/secureboot/keys
+    cp "\${key_dir}"/*.auth /etc/secureboot/keys/
+    
+    # Copy auth files to EFI partition
+    mkdir -p /boot/efi/EFI/keys
+    cp "\${key_dir}"/*.auth /boot/efi/EFI/keys/
 EOF
     
-    log_success "Secure Boot keys generated"
+    log_success "ESL files converted and signed"
 }
 
 # Sign EFI binaries
@@ -372,9 +288,159 @@ When = PostTransaction
 Exec = /usr/bin/sh -c '/usr/bin/find /boot -name "vmlinuz-*" -exec /usr/bin/sbsign --key \$key_dir/db.key --cert \$key_dir/db.crt --output {} {} \;'
 Exec = /usr/bin/sh -c '/usr/bin/sbsign --key \$key_dir/db.key --cert \$key_dir/db.crt --output /boot/efi/EFI/refind/refind_x64.efi /boot/efi/EFI/refind/refind_x64.efi'
 HOOK_EOF
+
+    # Create a script for signing
+    cat > /usr/local/bin/sign-efi-binaries << SCRIPT_EOF
+#!/bin/bash
+key_dir="/etc/secureboot/keys"
+efi_dir="/boot/efi"
+
+# Sign rEFInd
+if [[ -f "\${efi_dir}/EFI/refind/refind_x64.efi" ]]; then
+    sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
+        --output "\${efi_dir}/EFI/refind/refind_x64.efi" "\${efi_dir}/EFI/refind/refind_x64.efi"
+fi
+
+# Sign the kernel
+for kernel in /boot/vmlinuz-*; do
+    if [[ -f "\$kernel" ]]; then
+        sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
+            --output "\$kernel" "\$kernel"
+    fi
+done
+
+# Sign the bootloader
+if [[ -f "\${efi_dir}/EFI/BOOT/BOOTX64.EFI" ]]; then
+    sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
+        --output "\${efi_dir}/EFI/BOOT/BOOTX64.EFI" "\${efi_dir}/EFI/BOOT/BOOTX64.EFI"
+fi
+SCRIPT_EOF
+
+    chmod +x /usr/local/bin/sign-efi-binaries
 EOF
     
     log_success "Automatic signing setup complete"
+}
+
+# Configure system
+configure_system() {
+    log_info "Configuring system"
+    
+    # Chroot into the new system
+    arch-chroot /mnt /bin/bash <<EOF
+    # Set timezone
+    ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+    hwclock --systohc
+    
+    # Localization
+    echo "$LANGUAGE UTF-8" >> /etc/locale.gen
+    locale-gen
+    echo "LANG=$LANGUAGE" > /etc/locale.conf
+    
+    # Network configuration
+    echo "$HOSTNAME" > /etc/hostname
+    cat > /etc/hosts << HOSTS_EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
+HOSTS_EOF
+    
+    # Set root password
+    echo "Setting root password:"
+    passwd
+    
+    # Install additional packages
+    pacman -Sy --noconfirm \
+        sudo nano vim git curl wget openssh \
+        networkmanager network-manager-applet \
+        dialog mtools dosfstools \
+        refind-efi efibootmgr
+    
+    # Enable services
+    systemctl enable NetworkManager
+    
+    # Create user
+    useradd -m -G wheel -s /bin/bash "$USERNAME"
+    echo "Setting password for $USERNAME:"
+    passwd "$USERNAME"
+    
+    # Configure sudo
+    echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
+    
+    # Install and configure rEFInd
+    refind-install
+    
+    # Create rEFInd config directory if it doesn't exist
+    mkdir -p /boot/efi/EFI/refind/
+    
+    # Get root partition UUID
+    ROOT_UUID=\$(blkid -s UUID -o value $ROOT_PARTITION)
+    
+    # Configure rEFInd
+    cat > /boot/efi/EFI/refind/refind.conf << REFIND_EOF
+timeout 5
+use_nvram false
+scan_all_linux_kernels true
+also_scan_dirs @/EFI/ubuntu,@/EFI/BOOT
+fold_linux_kernels false
+menuentry "Arch Linux" {
+    icon     /EFI/refind/icons/os_arch.png
+    volume   "Arch Linux"
+    loader   /vmlinuz-linux
+    initrd   /initramfs-linux.img
+    options  "root=UUID=\$ROOT_UUID rw"
+}
+menuentry "Windows Boot Manager" {
+    icon     /EFI/refind/icons/os_win.png
+    volume   "Windows Boot Manager"
+    loader   /EFI/Microsoft/Boot/bootmgfw.efi
+}
+REFIND_EOF
+    
+    # Generate initramfs
+    mkinitcpio -P
+    
+    # Install microcode
+    if grep -q "Intel" /proc/cpuinfo; then
+        pacman -S --noconfirm intel-ucode
+    elif grep -q "AMD" /proc/cpuinfo; then
+        pacman -S --noconfirm amd-ucode
+    fi
+    
+    # Update rEFInd config with microcode
+    if [ -f /boot/intel-ucode.img ]; then
+        sed -i 's/initrd   \/initramfs-linux.img/initrd   \/intel-ucode.img\n    initrd   \/initramfs-linux.img/' /boot/efi/EFI/refind/refind.conf
+    elif [ -f /boot/amd-ucode.img ]; then
+        sed -i 's/initrd   \/initramfs-linux.img/initrd   \/amd-ucode.img\n    initrd   \/initramfs-linux.img/' /boot/efi/EFI/refind/refind.conf
+    fi
+EOF
+    
+    log_success "System configured"
+}
+
+# Install desktop environment
+install_desktop() {
+    log_info "Installing desktop environment"
+    
+    arch-chroot /mnt /bin/bash <<EOF
+    # Install KDE Plasma
+    pacman -Sy --noconfirm \
+        plasma-meta plasma-desktop sddm \
+        konsole dolphin kate \
+        firefox vlc \
+        noto-fonts noto-fonts-cjk noto-fonts-emoji \
+        ttf-dejavu ttf-liberation
+    
+    # Enable display manager
+    systemctl enable sddm
+    
+    # Install additional applications
+    pacman -Sy --noconfirm \
+        libreoffice-still gimp inkscape \
+        audacity handbrake
+EOF
+    
+    log_success "Desktop environment installed"
 }
 
 # Main Secure Boot setup function
@@ -385,6 +451,7 @@ setup_secure_boot() {
     
     install_secure_boot_packages
     generate_secure_boot_keys
+    convert_and_sign_esl
     sign_efi_binaries
     setup_automatic_signing
     
@@ -447,7 +514,7 @@ main_installation() {
     log_warning "Don't forget to:"
     log_warning "1. Remove the installation media"
     log_warning "2. Enable Secure Boot in your BIOS/UEFI settings"
-    log_warning "3. Enroll your Secure Boot keys"
+    log_warning "3. Enroll your Secure Boot keys from /etc/secureboot/keys/"
 }
 
 # Check if we're running on a live system
