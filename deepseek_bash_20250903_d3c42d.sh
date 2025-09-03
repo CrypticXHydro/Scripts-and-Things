@@ -1,0 +1,299 @@
+#!/bin/bash
+
+# Secure Boot Installation Script
+# Based on RyanTheTide's LinuxConfigurations with Secure Boot support
+# Original script: https://raw.githubusercontent.com/RyanTheTide/LinuxConfigurations/refs/heads/main/scripts/install_v2.sh
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
+        exit 1
+    fi
+}
+
+# Check if UEFI is being used
+check_uefi() {
+    if [[ ! -d /sys/firmware/efi ]]; then
+        log_error "This system does not appear to be using UEFI firmware. Secure Boot requires UEFI."
+        exit 1
+    fi
+}
+
+# Check if Secure Boot is available
+check_secure_boot_capability() {
+    if [[ -d /sys/firmware/efi ]]; then
+        if [[ -f /sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data ]]; then
+            local secure_boot_status=$(od -An -t u1 /sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data)
+            if [[ $secure_boot_status -eq 1 ]]; then
+                log_info "Secure Boot is enabled in firmware"
+                SECURE_BOOT_ENABLED=1
+            else
+                log_info "Secure Boot is available but not enabled in firmware"
+                SECURE_BOOT_ENABLED=0
+            fi
+            return 0
+        fi
+    fi
+    log_warning "Secure Boot is not available on this system"
+    SECURE_BOOT_ENABLED=0
+    return 1
+}
+
+# Install required packages for Secure Boot
+install_secure_boot_packages() {
+    log_info "Installing Secure Boot packages..."
+    
+    # Determine package manager
+    if command -v apt >/dev/null 2>&1; then
+        apt update
+        apt install -y efibootmgr shim-signed grub-efi-amd64-signed shim-unsigned
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm efibootmgr shim-signed grub efibootmgr
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y efibootmgr shim-x64 grub2-efi-x64 grub2-efi-x64-modules
+    else
+        log_error "Unsupported package manager"
+        return 1
+    fi
+    
+    log_success "Secure Boot packages installed"
+}
+
+# Generate keys for Secure Boot
+generate_secure_boot_keys() {
+    log_info "Generating Secure Boot keys..."
+    
+    # Create directory for keys
+    local key_dir="/etc/secureboot/keys"
+    mkdir -p "$key_dir"
+    
+    # Generate Platform Key (PK)
+    openssl req -newkey rsa:4096 -nodes -keyout "${key_dir}/PK.key" \
+        -new -x509 -sha256 -days 3650 -out "${key_dir}/PK.crt" \
+        -subj "/CN=Platform Key/"
+    
+    # Generate Key Exchange Key (KEK)
+    openssl req -newkey rsa:4096 -nodes -keyout "${key_dir}/KEK.key" \
+        -new -x509 -sha256 -days 3650 -out "${key_dir}/KEK.crt" \
+        -subj "/CN=Key Exchange Key/"
+    
+    # Generate Signature Database (db) key
+    openssl req -newkey rsa:4096 -nodes -keyout "${key_dir}/db.key" \
+        -new -x509 -sha256 -days 3650 -out "${key_dir}/db.crt" \
+        -subj "/CN=Signature Database key/"
+    
+    log_success "Secure Boot keys generated"
+}
+
+# Install keys to EFI
+install_secure_boot_keys() {
+    log_info "Installing Secure Boot keys to EFI..."
+    
+    local key_dir="/etc/secureboot/keys"
+    
+    # Convert certificates to ESL format
+    cert-to-efi-sig-list -g "$(uuidgen)" "${key_dir}/PK.crt" "${key_dir}/PK.esl"
+    cert-to-efi-sig-list -g "$(uuidgen)" "${key_dir}/KEK.crt" "${key_dir}/KEK.esl"
+    cert-to-efi-sig-list -g "$(uuidgen)" "${key_dir}/db.crt" "${key_dir}/db.esl"
+    
+    # Sign the ESL files
+    sign-efi-sig-list -g "$(uuidgen)" -k "${key_dir}/PK.key" -c "${key_dir}/PK.crt" PK "${key_dir}/PK.esl"
+    sign-efi-sig-list -g "$(uuidgen)" -k "${key_dir}/PK.key" -c "${key_dir}/PK.crt" KEK "${key_dir}/KEK.esl"
+    sign-efi-sig-list -g "$(uuidgen)" -k "${key_dir}/PK.key" -c "${key_dir}/PK.crt" db "${key_dir}/db.esl"
+    
+    # Copy keys to EFI partition
+    local efi_dir="/boot/efi"
+    local keys_dir="${efi_dir}/EFI/keys"
+    
+    mkdir -p "$keys_dir"
+    cp "${key_dir}/PK.auth" "$keys_dir"
+    cp "${key_dir}/KEK.auth" "$keys_dir"
+    cp "${key_dir}/db.auth" "$keys_dir"
+    
+    log_success "Secure Boot keys installed to EFI"
+}
+
+# Configure GRUB for Secure Boot
+configure_grub_secure_boot() {
+    log_info "Configuring GRUB for Secure Boot..."
+    
+    # Backup original GRUB configuration
+    cp /etc/default/grub /etc/default/grub.backup
+    
+    # Add Secure Boot options to GRUB configuration
+    if ! grep -q "GRUB_CMDLINE_LINUX.*=.*sb" /etc/default/grub; then
+        sed -i 's/GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 quiet splash"/' /etc/default/grub
+    fi
+    
+    # Update GRUB
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub
+    elif command -v grub-mkconfig >/dev/null 2>&1; then
+        grub-mkconfig -o /boot/grub/grub.cfg
+    fi
+    
+    # Install GRUB for EFI
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --recheck
+    
+    log_success "GRUB configured for Secure Boot"
+}
+
+# Sign EFI binaries
+sign_efi_binaries() {
+    log_info "Signing EFI binaries..."
+    
+    local key_dir="/etc/secureboot/keys"
+    local efi_dir="/boot/efi"
+    
+    # Sign the GRUB EFI binary
+    if [[ -f "${efi_dir}/EFI/GRUB/grubx64.efi" ]]; then
+        sbsign --key "${key_dir}/db.key" --cert "${key_dir}/db.crt" \
+            --output "${efi_dir}/EFI/GRUB/grubx64.efi" "${efi_dir}/EFI/GRUB/grubx64.efi"
+    fi
+    
+    # Sign the shim binary
+    if [[ -f "${efi_dir}/EFI/ubuntu/shimx64.efi" ]]; then
+        sbsign --key "${key_dir}/db.key" --cert "${key_dir}/db.crt" \
+            --output "${efi_dir}/EFI/ubuntu/shimx64.efi" "${efi_dir}/EFI/ubuntu/shimx64.efi"
+    fi
+    
+    # Sign the kernel
+    for kernel in /boot/vmlinuz-*; do
+        if [[ -f "$kernel" ]]; then
+            sbsign --key "${key_dir}/db.key" --cert "${key_dir}/db.crt" \
+                --output "$kernel" "$kernel"
+        fi
+    done
+    
+    log_success "EFI binaries signed"
+}
+
+# Setup automatic signing for future kernel updates
+setup_automatic_signing() {
+    log_info "Setting up automatic signing for future kernel updates..."
+    
+    local key_dir="/etc/secureboot/keys"
+    
+    # Create a hook for package managers to sign kernels
+    if command -v apt >/dev/null 2>&1; then
+        # For Debian/Ubuntu
+        local hook_dir="/etc/kernel/postinst.d"
+        local hook_file="${hook_dir}/zz-secureboot-sign"
+        
+        mkdir -p "$hook_dir"
+        cat > "$hook_file" << EOF
+#!/bin/bash
+for kernel in /boot/vmlinuz-*; do
+    if [[ -f "\$kernel" ]]; then
+        sbsign --key "${key_dir}/db.key" --cert "${key_dir}/db.crt" \\
+            --output "\$kernel" "\$kernel"
+    fi
+done
+EOF
+        chmod +x "$hook_file"
+    fi
+    
+    log_success "Automatic signing setup complete"
+}
+
+# Main Secure Boot setup function
+setup_secure_boot() {
+    log_info "Starting Secure Boot setup..."
+    
+    check_root
+    check_uefi
+    
+    if ! check_secure_boot_capability; then
+        log_warning "Secure Boot is not available on this system. Continuing with installation without Secure Boot."
+        return 0
+    fi
+    
+    install_secure_boot_packages
+    generate_secure_boot_keys
+    install_secure_boot_keys
+    configure_grub_secure_boot
+    sign_efi_binaries
+    setup_automatic_signing
+    
+    log_success "Secure Boot setup complete!"
+    log_warning "You need to enroll the keys in your UEFI firmware to enable Secure Boot"
+    log_info "The keys are located in: /etc/secureboot/keys/"
+    log_info "You need to copy the .auth files to a USB drive and enroll them in your BIOS"
+}
+
+# Download and execute the original installation script
+run_original_installation() {
+    log_info "Downloading and executing the original installation script..."
+    
+    local temp_script="/tmp/install_v2.sh"
+    
+    # Download the original script
+    if curl -s -o "$temp_script" "https://raw.githubusercontent.com/RyanTheTide/LinuxConfigurations/refs/heads/main/scripts/install_v2.sh"; then
+        log_success "Downloaded original installation script"
+        
+        # Make it executable
+        chmod +x "$temp_script"
+        
+        # Execute the script
+        log_info "Running the original installation script..."
+        bash "$temp_script"
+        
+        # Check if the script executed successfully
+        if [[ $? -eq 0 ]]; then
+            log_success "Original installation script completed successfully"
+        else
+            log_error "Original installation script failed"
+            exit 1
+        fi
+    else
+        log_error "Failed to download the original installation script"
+        exit 1
+    fi
+}
+
+# Main function
+main() {
+    log_info "Starting installation with Secure Boot support..."
+    
+    # Run the original installation
+    run_original_installation
+    
+    # Setup Secure Boot
+    setup_secure_boot
+    
+    log_success "Installation complete!"
+    log_warning "If you want to enable Secure Boot, remember to:"
+    log_warning "1. Reboot into your UEFI/BIOS settings"
+    log_warning "2. Enable Secure Boot"
+    log_warning "3. Enroll the keys from /etc/secureboot/keys/"
+}
+
+# Execute main function
+main "$@"
