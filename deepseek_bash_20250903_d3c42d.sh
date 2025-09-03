@@ -255,7 +255,7 @@ run_original_installation() {
     local temp_script="/tmp/install_v2.sh"
     
     # Download the original script
-    if curl -s -o "$temp_script" "https://raw.githubusercontent.com/RyanTheTide/LinuxConfigurations/refs/heads/main/scripts/install_v2.sh"; then
+    if curl -s -o "$temp_script" "https://raw.githubusercontent.com/RyanTheTide/LinuxConfigurations/refs/heads/main/scripts/install_v1.sh"; then
         log_success "Downloaded original installation script"
         
         # Make it executable
