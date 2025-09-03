@@ -248,45 +248,5 @@ setup_secure_boot() {
     log_info "You need to copy the .auth files to a USB drive and enroll them in your BIOS"
 }
 
-# Download and execute the original installation script
-run_original_installation() {
-    log_info "Downloading and executing the original installation script..."
-    
-    local temp_script="/tmp/install_v2.sh"
-    
-    # Download the original script
-    if curl -s -o "$temp_script" "https://raw.githubusercontent.com/RyanTheTide/LinuxConfigurations/refs/heads/main/scripts/install_v2.sh"; then
-        log_success "Downloaded original installation script"
-        
-        # Make it executable
-        chmod +x "$temp_script"
-        
-        # Execute the script
-        log_info "Running the original installation script..."
-        bash "$temp_script"
-        
-        # Check if the script executed successfully
-        if [[ $? -eq 0 ]]; then
-            log_success "Original installation script completed successfully"
-        else
-            log_error "Original installation script failed"
-            exit 1
-        fi
-    else
-        log_error "Failed to download the original installation script"
-        exit 1
-    fi
-}
-
-# Main function
-main() {
-    log_info "Starting installation with Secure Boot support..."
-    log_success "Installation complete!"
-    log_warning "If you want to enable Secure Boot, remember to:"
-    log_warning "1. Reboot into your UEFI/BIOS settings"
-    log_warning "2. Enable Secure Boot"
-    log_warning "3. Enroll the keys from /etc/secureboot/keys/"
-}
-
 # Execute main function
 main "$@"
