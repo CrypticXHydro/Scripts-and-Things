@@ -74,7 +74,7 @@ install_secure_boot_packages() {
         apt update
         apt install -y efibootmgr shim-signed grub-efi-amd64-signed sbsigntool efitools
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm efibootmgr shim-signed grub efibootmgr sbsigntool efitools
+        pacman -Sy --noconfirm efibootmgr sbsigntool efitools
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y efibootmgr shim-x64 grub2-efi-x64 grub2-efi-x64-modules sbsigntool efitools
     else
@@ -177,12 +177,6 @@ sign_efi_binaries() {
             --output "${efi_dir}/EFI/GRUB/grubx64.efi" "${efi_dir}/EFI/GRUB/grubx64.efi"
     fi
     
-    # Sign the shim binary
-    if [[ -f "${efi_dir}/EFI/ubuntu/shimx64.efi" ]]; then
-        sbsign --key "${key_dir}/db.key" --cert "${key_dir}/db.crt" \
-            --output "${efi_dir}/EFI/ubuntu/shimx64.efi" "${efi_dir}/EFI/ubuntu/shimx64.efi"
-    fi
-    
     # Sign the kernel
     for kernel in /boot/vmlinuz-*; do
         if [[ -f "$kernel" ]]; then
@@ -247,7 +241,7 @@ setup_secure_boot() {
     log_info "You need to copy the .auth files to a USB drive and enroll them in your BIOS"
 }
 
-# Function to install base system (replacement for original script)
+# Function to install base system
 install_base_system() {
     log_info "Starting base system installation..."
     
@@ -272,21 +266,23 @@ EOF
     echo "Set root password:"
     passwd
     
-    # Install bootloader
-    bootctl install
-    
-    # Create bootloader entry
-    cat > /boot/loader/entries/arch.conf << EOF
-title   Arch Linux
-linux   /vmlinuz-linux
-initrd  /initramfs-linux.img
-options root=PARTUUID=$(blkid -s PARTUUID -o value /dev/sda2) rw
-EOF
-    
-    # Create loader.conf
-    echo "default arch" > /boot/loader/loader.conf
-    echo "timeout 3" >> /boot/loader/loader.conf
-    echo "editor 0" >> /boot/loader/loader.conf
+    # Install and configure bootloader
+    if command -v apt >/dev/null 2>&1; then
+        # Debian/Ubuntu
+        apt install -y grub-efi-amd64 efibootmgr
+        grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
+        update-grub
+    elif command -v pacman >/dev/null 2>&1; then
+        # Arch Linux
+        pacman -Sy --noconfirm grub efibootmgr
+        grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
+        grub-mkconfig -o /boot/grub/grub.cfg
+    elif command -v dnf >/dev/null 2>&1; then
+        # Fedora
+        dnf install -y grub2-efi-x64-modules shim-x64
+        grub2-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
+        grub2-mkconfig -o /boot/grub2/grub.cfg
+    fi
     
     log_success "Base system installation complete"
 }
@@ -295,17 +291,19 @@ EOF
 install_desktop_environment() {
     log_info "Installing desktop environment..."
     
-    # Install Xorg and graphics drivers
-    pacman -S --noconfirm xorg xorg-xinit mesa nvidia nvidia-utils nvidia-settings
-    
-    # Install desktop environment (KDE Plasma in this example)
-    pacman -S --noconfirm plasma sddm konsole dolphin
-    
-    # Enable display manager
-    systemctl enable sddm
-    
-    # Install additional applications
-    pacman -S --noconfirm firefox vlc gimp libreoffice-still
+    # Determine package manager and install appropriate desktop
+    if command -v apt >/dev/null 2>&1; then
+        # Debian/Ubuntu - install GNOME
+        apt install -y ubuntu-desktop
+    elif command -v pacman >/dev/null 2>&1; then
+        # Arch Linux - install KDE Plasma
+        pacman -Sy --noconfirm plasma-meta plasma-desktop sddm konsole
+        systemctl enable sddm
+    elif command -v dnf >/dev/null 2>&1; then
+        # Fedora - install GNOME
+        dnf groupinstall -y "Basic Desktop" "GNOME"
+        systemctl enable gdm
+    fi
     
     log_success "Desktop environment installation complete"
 }
@@ -320,7 +318,15 @@ create_user() {
     passwd "$username"
     
     # Allow wheel group to use sudo
-    sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+    if command -v apt >/dev/null 2>&1; then
+        # Debian/Ubuntu
+        apt install -y sudo
+    fi
+    
+    # Enable sudo for wheel group
+    if ! grep -q "^%wheel" /etc/sudoers; then
+        echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
+    fi
     
     log_success "User account created"
 }
@@ -329,25 +335,30 @@ create_user() {
 main() {
     log_info "Starting installation with Secure Boot support..."
     
-    # Check if we're in a chroot environment
-    if [[ $(stat -c %d:%i /) != $(stat -c %d:%i /proc/1/root/.) ]]; then
-        # We're not in chroot, so run the base installation
-        install_base_system
-        
-        # Then chroot and continue installation
-        log_info "Chrooting into new system to continue installation..."
-        cp "$0" /mnt/
-        arch-chroot /mnt bash /$(basename "$0") --chroot "$username"
-        
-        # Setup Secure Boot after base installation
+    # Check if we're running on a live system or installed system
+    if [[ -f /etc/os-release ]]; then
+        # We're on an installed system, setup Secure Boot
         setup_secure_boot
     else
-        # We're in chroot, so run the rest of the installation
-        if [[ "$1" == "--chroot" ]]; then
-            username="$2"
-            install_desktop_environment
-            create_user
+        # We're on a live system, perform installation
+        check_root
+        
+        # Ask for username if not provided
+        if [[ -z "$username" ]]; then
+            read -p "Enter username: " username
         fi
+        
+        # Install base system
+        install_base_system
+        
+        # Create user
+        create_user
+        
+        # Install desktop environment
+        install_desktop_environment
+        
+        # Setup Secure Boot
+        setup_secure_boot
     fi
     
     log_success "Installation complete!"
