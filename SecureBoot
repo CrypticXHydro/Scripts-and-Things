@@ -2,7 +2,6 @@
 
 # Secure Boot Installation Script
 # Based on RyanTheTide's LinuxConfigurations with Secure Boot support
-# Original script: https://raw.githubusercontent.com/RyanTheTide/LinuxConfigurations/refs/heads/main/scripts/install_v2.sh
 
 set -e
 
@@ -73,11 +72,11 @@ install_secure_boot_packages() {
     # Determine package manager
     if command -v apt >/dev/null 2>&1; then
         apt update
-        apt install -y efibootmgr shim-signed grub-efi-amd64-signed shim-unsigned
+        apt install -y efibootmgr shim-signed grub-efi-amd64-signed sbsigntool efitools
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm efibootmgr shim-signed grub efibootmgr
+        pacman -Sy --noconfirm efibootmgr shim-signed grub efibootmgr sbsigntool efitools
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y efibootmgr shim-x64 grub2-efi-x64 grub2-efi-x64-modules
+        dnf install -y efibootmgr shim-x64 grub2-efi-x64 grub2-efi-x64-modules sbsigntool efitools
     else
         log_error "Unsupported package manager"
         return 1
@@ -248,5 +247,124 @@ setup_secure_boot() {
     log_info "You need to copy the .auth files to a USB drive and enroll them in your BIOS"
 }
 
-# Execute main function
-main "$@"
+# Function to install base system (replacement for original script)
+install_base_system() {
+    log_info "Starting base system installation..."
+    
+    # Set timezone
+    ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime
+    hwclock --systohc
+    
+    # Localization
+    sed -i 's/^#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+    locale-gen
+    echo "LANG=en_US.UTF-8" > /etc/locale.conf
+    
+    # Network configuration
+    echo "arch" > /etc/hostname
+    cat > /etc/hosts << EOF
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   arch.localdomain arch
+EOF
+    
+    # Set root password
+    echo "Set root password:"
+    passwd
+    
+    # Install bootloader
+    bootctl install
+    
+    # Create bootloader entry
+    cat > /boot/loader/entries/arch.conf << EOF
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /initramfs-linux.img
+options root=PARTUUID=$(blkid -s PARTUUID -o value /dev/sda2) rw
+EOF
+    
+    # Create loader.conf
+    echo "default arch" > /boot/loader/loader.conf
+    echo "timeout 3" >> /boot/loader/loader.conf
+    echo "editor 0" >> /boot/loader/loader.conf
+    
+    log_success "Base system installation complete"
+}
+
+# Function to install desktop environment
+install_desktop_environment() {
+    log_info "Installing desktop environment..."
+    
+    # Install Xorg and graphics drivers
+    pacman -S --noconfirm xorg xorg-xinit mesa nvidia nvidia-utils nvidia-settings
+    
+    # Install desktop environment (KDE Plasma in this example)
+    pacman -S --noconfirm plasma sddm konsole dolphin
+    
+    # Enable display manager
+    systemctl enable sddm
+    
+    # Install additional applications
+    pacman -S --noconfirm firefox vlc gimp libreoffice-still
+    
+    log_success "Desktop environment installation complete"
+}
+
+# Function to create user account
+create_user() {
+    log_info "Creating user account..."
+    
+    # Create user with default settings
+    useradd -m -G wheel -s /bin/bash "$username"
+    echo "Set password for $username:"
+    passwd "$username"
+    
+    # Allow wheel group to use sudo
+    sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+    
+    log_success "User account created"
+}
+
+# Main function
+main() {
+    log_info "Starting installation with Secure Boot support..."
+    
+    # Check if we're in a chroot environment
+    if [[ $(stat -c %d:%i /) != $(stat -c %d:%i /proc/1/root/.) ]]; then
+        # We're not in chroot, so run the base installation
+        install_base_system
+        
+        # Then chroot and continue installation
+        log_info "Chrooting into new system to continue installation..."
+        cp "$0" /mnt/
+        arch-chroot /mnt bash /$(basename "$0") --chroot "$username"
+        
+        # Setup Secure Boot after base installation
+        setup_secure_boot
+    else
+        # We're in chroot, so run the rest of the installation
+        if [[ "$1" == "--chroot" ]]; then
+            username="$2"
+            install_desktop_environment
+            create_user
+        fi
+    fi
+    
+    log_success "Installation complete!"
+    log_warning "If you want to enable Secure Boot, remember to:"
+    log_warning "1. Reboot into your UEFI/BIOS settings"
+    log_warning "2. Enable Secure Boot"
+    log_warning "3. Enroll the keys from /etc/secureboot/keys/"
+}
+
+# Parse command line arguments
+if [[ "$1" == "--chroot" ]]; then
+    username="$2"
+    main "$@"
+else
+    # Ask for username if not provided
+    if [[ -z "$username" ]]; then
+        read -p "Enter username: " username
+    fi
+    main
+fi
