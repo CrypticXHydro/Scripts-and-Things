@@ -149,7 +149,7 @@ install_base_system() {
     pacstrap /mnt base base-devel linux linux-firmware
     
     # Generate fstab
-    genfstab -U /mnt >> /mnt/mnt/fstab
+    genfstab -U /mnt >> /mnt/etc/fstab
     
     log_success "Base system installed"
 }
@@ -178,7 +178,7 @@ configure_system() {
 HOSTS_EOF
     
     # Set root password
-    echo "Set root password:"
+    echo "Setting root password:"
     passwd
     
     # Install additional packages
@@ -193,14 +193,17 @@ HOSTS_EOF
     
     # Create user
     useradd -m -G wheel -s /bin/bash "$USERNAME"
-    echo "Set password for $USERNAME:"
+    echo "Setting password for $USERNAME:"
     passwd "$USERNAME"
     
     # Configure sudo
     echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
     
-    # Install rEFInd
-    refind-install
+    # Install and configure rEFInd
+    refind-install --usedefault /dev/disk/by-partuuid/$(blkid -s PARTUUID -o value $EFI_PARTITION)
+    
+    # Create rEFInd config directory if it doesn't exist
+    mkdir -p /boot/efi/EFI/refind/
     
     # Configure rEFInd
     cat > /boot/efi/EFI/refind/refind.conf << REFIND_EOF
@@ -263,8 +266,7 @@ install_desktop() {
     # Install additional applications
     pacman -Sy --noconfirm \
         libreoffice-still gimp inkscape \
-        audacity handbrake \
-        steam wine-staging
+        audacity handbrake
 EOF
     
     log_success "Desktop environment installed"
@@ -287,7 +289,7 @@ generate_secure_boot_keys() {
     
     arch-chroot /mnt /bin/bash <<EOF
     # Create directory for keys
-    local key_dir="/etc/secureboot/keys"
+    key_dir="/etc/secureboot/keys"
     mkdir -p "\$key_dir"
     
     # Generate Platform Key (PK)
@@ -314,8 +316,8 @@ sign_efi_binaries() {
     log_info "Signing EFI binaries..."
     
     arch-chroot /mnt /bin/bash <<EOF
-    local key_dir="/etc/secureboot/keys"
-    local efi_dir="/boot/efi"
+    key_dir="/etc/secureboot/keys"
+    efi_dir="/boot/efi"
     
     # Sign rEFInd
     if [[ -f "\${efi_dir}/EFI/refind/refind_x64.efi" ]]; then
@@ -346,11 +348,11 @@ setup_automatic_signing() {
     log_info "Setting up automatic signing for future kernel updates..."
     
     arch-chroot /mnt /bin/bash <<EOF
-    local key_dir="/etc/secureboot/keys"
+    key_dir="/etc/secureboot/keys"
     
     # Create a hook for package managers to sign kernels
-    local hook_dir="/etc/pacman.d/hooks"
-    local hook_file="\${hook_dir}/999-sign-kernel-for-secureboot.hook"
+    hook_dir="/etc/pacman.d/hooks"
+    hook_file="\${hook_dir}/999-sign-kernel-for-secureboot.hook"
     
     mkdir -p "\$hook_dir"
     cat > "\$hook_file" << HOOK_EOF
