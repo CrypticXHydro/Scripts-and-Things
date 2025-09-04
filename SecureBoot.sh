@@ -51,6 +51,23 @@ check_uefi() {
     fi
 }
 
+# Function to detect distribution
+detect_distro() {
+    if [ -f /etc/arch-release ]; then
+        echo "arch"
+    elif [ -f /etc/debian_version ]; then
+        echo "debian"
+    elif [ -f /etc/fedora-release ]; then
+        echo "fedora"
+    elif [ -f /etc/redhat-release ]; then
+        echo "redhat"
+    elif [ -f /etc/SuSE-release ]; then
+        echo "suse"
+    else
+        echo "unknown"
+    fi
+}
+
 # Function to check if secure boot is enabled
 check_secure_boot() {
     if [ -d /sys/firmware/efi ] && [ -f /sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data ]; then
@@ -72,19 +89,79 @@ check_secure_boot() {
 install_secure_boot_deps() {
     print_section "Installing Secure Boot Dependencies"
     
-    # Check if we're on Arch Linux or Debian/Ubuntu
-    if command -v pacman &> /dev/null; then
-        # Arch Linux
-        pacman -S --needed --noconfirm shim-signed sbsigntools efibootmgr mokutil
-    elif command -v apt-get &> /dev/null; then
-        # Debian/Ubuntu
-        apt-get update
-        apt-get install -y shim-signed sbsigntools efibootmgr mokutil
-    else
-        print_error "Unsupported distribution for automatic Secure Boot setup"
+    local distro=$(detect_distro)
+    
+    case $distro in
+        "arch")
+            print_status "Installing secure boot packages for Arch Linux"
+            pacman -Sy --needed --noconfirm shim-signed sbsigntools efibootmgr mokutil
+            
+            # Check if packages were installed successfully
+            if ! command -v mokutil &> /dev/null; then
+                print_warning "mokutil not found in official repos, trying AUR"
+                # Try to install from AUR if available (using yay or paru)
+                if command -v yay &> /dev/null; then
+                    yay -S --noconfirm mokutil
+                elif command -v paru &> /dev/null; then
+                    paru -S --noconfirm mokutil
+                else
+                    print_error "mokutil not available and no AUR helper found"
+                    print_warning "Secure boot management will be limited"
+                fi
+            fi
+            ;;
+            
+        "debian"|"ubuntu")
+            print_status "Installing secure boot packages for Debian/Ubuntu"
+            apt-get update
+            apt-get install -y shim-signed sbsigntools efibootmgr mokutil
+            ;;
+            
+        "fedora"|"redhat")
+            print_status "Installing secure boot packages for Fedora/RHEL"
+            dnf install -y shim-unsigned sbsigntools efibootmgr mokutil
+            ;;
+            
+        "suse")
+            print_status "Installing secure boot packages for openSUSE"
+            zypper install -y shim sbsigntools efibootmgr mokutil
+            ;;
+            
+        *)
+            print_error "Unsupported distribution: $distro"
+            print_warning "Please manually install: shim-signed sbsigntools efibootmgr mokutil"
+            return 1
+            ;;
+    esac
+    
+    # Verify installation of each package
+    local missing_packages=()
+    
+    if ! command -v sbsign &> /dev/null; then
+        missing_packages+=("sbsigntools")
+    fi
+    
+    if ! command -v efibootmgr &> /dev/null; then
+        missing_packages+=("efibootmgr")
+    fi
+    
+    if ! command -v mokutil &> /dev/null; then
+        missing_packages+=("mokutil")
+    fi
+    
+    # Check for shim (may have different names)
+    if [ ! -f /usr/share/shim-signed/shimx64.efi ] && 
+       [ ! -f /usr/lib/shim/shimx64.efi ] && 
+       [ ! -f /boot/efi/EFI/*/shimx64.efi ]; then
+        missing_packages+=("shim-signed")
+    fi
+    
+    if [ ${#missing_packages[@]} -ne 0 ]; then
+        print_error "Failed to install: ${missing_packages[*]}"
         return 1
     fi
     
+    print_status "All secure boot dependencies installed successfully"
     return 0
 }
 
@@ -95,18 +172,38 @@ setup_shim_and_mok() {
     local esp_mount="/boot/efi"
     local refind_dir="$esp_mount/EFI/refind"
     
-    # Copy shim to ESP
+    # Find shim location
+    local shim_path=""
     if [ -f "/usr/share/shim-signed/shimx64.efi" ]; then
-        cp "/usr/share/shim-signed/shimx64.efi" "$esp_mount/EFI/BOOT/BOOTX64.EFI"
-        cp "/usr/share/shim-signed/shimx64.efi" "$refind_dir/shimx64.efi"
-        print_status "Shim copied to ESP"
+        shim_path="/usr/share/shim-signed/shimx64.efi"
+    elif [ -f "/usr/lib/shim/shimx64.efi" ]; then
+        shim_path="/usr/lib/shim/shimx64.efi"
     fi
     
-    # Copy MokManager
+    # Copy shim to ESP if found
+    if [ -n "$shim_path" ]; then
+        cp "$shim_path" "$esp_mount/EFI/BOOT/BOOTX64.EFI"
+        cp "$shim_path" "$refind_dir/shimx64.efi"
+        print_status "Shim copied to ESP"
+    else
+        print_warning "Shim not found in standard locations"
+    fi
+    
+    # Find MokManager location
+    local mokmanager_path=""
     if [ -f "/usr/share/shim-signed/mmx64.efi" ]; then
-        cp "/usr/share/shim-signed/mmx64.efi" "$esp_mount/EFI/BOOT/"
-        cp "/usr/share/shim-signed/mmx64.efi" "$refind_dir/"
+        mokmanager_path="/usr/share/shim-signed/mmx64.efi"
+    elif [ -f "/usr/lib/shim/mmx64.efi" ]; then
+        mokmanager_path="/usr/lib/shim/mmx64.efi"
+    fi
+    
+    # Copy MokManager to ESP if found
+    if [ -n "$mokmanager_path" ]; then
+        cp "$mokmanager_path" "$esp_mount/EFI/BOOT/"
+        cp "$mokmanager_path" "$refind_dir/"
         print_status "MokManager copied to ESP"
+    else
+        print_warning "MokManager not found in standard locations"
     fi
     
     # Sign rEFInd with your key (if you have one) or use shim's built-in validation
@@ -115,6 +212,21 @@ setup_shim_and_mok() {
         if [ -f "$refind_dir/refind_x64.efi" ]; then
             print_warning "Note: For full Secure Boot, you should sign rEFInd with your own keys"
             print_warning "See: https://www.rodsbooks.com/refind/secureboot.html"
+            
+            # Generate a test key if none exists (for testing only - not for production)
+            local key_dir="/etc/refind.d/keys"
+            if [ ! -f "$key_dir/refind_local.key" ] && [ ! -f "$key_dir/refind_local.crt" ]; then
+                mkdir -p "$key_dir"
+                print_status "Generating test keys for signing (for testing only)"
+                openssl req -new -x509 -newkey rsa:2048 -keyout "$key_dir/refind_local.key" \
+                    -out "$key_dir/refind_local.crt" -nodes -days 3650 \
+                    -subj "/CN=Local Secure Boot Signing Key/"
+                
+                # Sign refind with the test key
+                sbsign --key "$key_dir/refind_local.key" --cert "$key_dir/refind_local.crt" \
+                    --output "$refind_dir/refind_x64.efi" "$refind_dir/refind_x64.efi"
+                print_status "rEFInd signed with test key"
+            fi
         fi
     fi
     
@@ -151,12 +263,22 @@ EOF
 enroll_mok() {
     print_section "Machine Owner Key Enrollment"
     
+    # Check if mokutil is available
+    if ! command -v mokutil &> /dev/null; then
+        print_error "mokutil not available - cannot set up MOK enrollment"
+        return 1
+    fi
+    
     # This would typically be done manually after reboot
     print_warning "After reboot, you will need to:"
     print_warning "1. Enter UEFI setup and enable Secure Boot"
     print_warning "2. On first boot with Secure Boot, MokManager will appear"
     print_warning "3. Follow prompts to enroll your keys"
     print_warning "4. Select 'Enroll key from disk' and choose your key"
+    
+    # Try to list current MOK state
+    print_status "Current MOK state:"
+    mokutil --sb-state 2>/dev/null || print_warning "Could not determine Secure Boot state"
     
     # Create a reminder script for post-install
     local reminder_script="/tmp/secure_boot_reminder.sh"
@@ -168,6 +290,11 @@ echo "2. Enable Secure Boot mode"
 echo "3. Save changes and exit"
 echo "4. On boot, MokManager should appear - follow prompts to enroll keys"
 echo "5. For rEFInd, you may need to enroll the rEFInd key if not using shim"
+echo ""
+echo "If you have issues:"
+echo "- Check if Secure Boot is enabled: mokutil --sb-state"
+echo "- List enrolled keys: mokutil --list-enrolled"
+echo "- For rEFInd issues: https://www.rodsbooks.com/refind/secureboot.html"
 EOF
     
     chmod +x "$reminder_script"
@@ -208,19 +335,35 @@ install_refind() {
     if [ "$INSTALL_REFIND" = true ]; then
         print_section "Installing rEFInd Boot Manager"
         
-        # Check if we're on Arch Linux or Debian/Ubuntu
-        if command -v pacman &> /dev/null; then
-            # Arch Linux
-            pacman -S --needed --noconfirm refind
-            refind-install
-        elif command -v apt-get &> /dev/null; then
-            # Debian/Ubuntu
-            apt-get install -y refind
-            refind-install
-        else
-            print_error "Unsupported distribution for automatic rEFInd setup"
-            return 1
-        fi
+        local distro=$(detect_distro)
+        
+        case $distro in
+            "arch")
+                pacman -Sy --needed --noconfirm refind
+                refind-install
+                ;;
+                
+            "debian"|"ubuntu")
+                apt-get update
+                apt-get install -y refind
+                refind-install
+                ;;
+                
+            "fedora"|"redhat")
+                dnf install -y refind
+                refind-install
+                ;;
+                
+            "suse")
+                zypper install -y refind
+                refind-install
+                ;;
+                
+            *)
+                print_error "Unsupported distribution for automatic rEFInd setup"
+                return 1
+                ;;
+        esac
         
         # Configure rEFInd for dual boot
         local esp_mount="/boot/efi"
@@ -261,27 +404,52 @@ install_drivers() {
     if [ "$INSTALL_DRIVERS" = true ]; then
         print_section "Installing Drivers"
         
-        # Check if we're on Arch Linux or Debian/Ubuntu
-        if command -v pacman &> /dev/null; then
-            # Arch Linux - install common drivers
-            pacman -S --needed --noconfirm \
-                mesa \
-                vulkan-radeon \
-                libva-mesa-driver \
-                mesa-vdpau \
-                networkmanager \
-                wireless_tools \
-                wpa_supplicant
-        elif command -v apt-get &> /dev/null; then
-            # Debian/Ubuntu - install common drivers
-            apt-get install -y \
-                mesa-vulkan-drivers \
-                libva-mesa-driver \
-                mesa-vdpau-drivers \
-                network-manager \
-                wireless-tools \
-                wpasupplicant
-        fi
+        local distro=$(detect_distro)
+        
+        case $distro in
+            "arch")
+                pacman -Sy --needed --noconfirm \
+                    mesa \
+                    vulkan-radeon \
+                    libva-mesa-driver \
+                    mesa-vdpau \
+                    networkmanager \
+                    wireless_tools \
+                    wpa_supplicant
+                ;;
+                
+            "debian"|"ubuntu")
+                apt-get update
+                apt-get install -y \
+                    mesa-vulkan-drivers \
+                    libva-mesa-driver \
+                    mesa-vdpau-drivers \
+                    network-manager \
+                    wireless-tools \
+                    wpasupplicant
+                ;;
+                
+            "fedora"|"redhat")
+                dnf install -y \
+                    mesa-vulkan-drivers \
+                    libva-mesa-driver \
+                    mesa-vdpau-drivers \
+                    NetworkManager \
+                    wireless-tools \
+                    wpa_supplicant
+                ;;
+                
+            "suse")
+                zypper install -y \
+                    Mesa \
+                    vulkan-drivers \
+                    libva-mesa-driver \
+                    mesa-vdpau-drivers \
+                    NetworkManager \
+                    wireless-tools \
+                    wpa_supplicant
+                ;;
+        esac
         
         print_status "Drivers installed successfully"
     else
@@ -294,37 +462,71 @@ install_utilities() {
     if [ "$INSTALL_UTILITIES" = true ]; then
         print_section "Installing Utilities"
         
-        # Check if we're on Arch Linux or Debian/Ubuntu
-        if command -v pacman &> /dev/null; then
-            # Arch Linux - install useful utilities
-            pacman -S --needed --noconfirm \
-                base-devel \
-                git \
-                vim \
-                htop \
-                curl \
-                wget \
-                rsync \
-                unzip \
-                ntfs-3g \
-                exfat-utils \
-                dosfstools
-        elif command -v apt-get &> /dev/null; then
-            # Debian/Ubuntu - install useful utilities
-            apt-get install -y \
-                build-essential \
-                git \
-                vim \
-                htop \
-                curl \
-                wget \
-                rsync \
-                unzip \
-                ntfs-3g \
-                exfat-fuse \
-                exfat-utils \
-                dosfstools
-        fi
+        local distro=$(detect_distro)
+        
+        case $distro in
+            "arch")
+                pacman -Sy --needed --noconfirm \
+                    base-devel \
+                    git \
+                    vim \
+                    htop \
+                    curl \
+                    wget \
+                    rsync \
+                    unzip \
+                    ntfs-3g \
+                    exfat-utils \
+                    dosfstools
+                ;;
+                
+            "debian"|"ubuntu")
+                apt-get update
+                apt-get install -y \
+                    build-essential \
+                    git \
+                    vim \
+                    htop \
+                    curl \
+                    wget \
+                    rsync \
+                    unzip \
+                    ntfs-3g \
+                    exfat-fuse \
+                    exfat-utils \
+                    dosfstools
+                ;;
+                
+            "fedora"|"redhat")
+                dnf install -y \
+                    @development-tools \
+                    git \
+                    vim \
+                    htop \
+                    curl \
+                    wget \
+                    rsync \
+                    unzip \
+                    ntfs-3g \
+                    exfat-utils \
+                    dosfstools
+                ;;
+                
+            "suse")
+                zypper install -y \
+                    -t pattern devel_basis \
+                    git \
+                    vim \
+                    htop \
+                    curl \
+                    wget \
+                    rsync \
+                    unzip \
+                    ntfs-3g \
+                    exfat-utils \
+                    dosfstools
+                ;;
+        esac
         
         print_status "Utilities installed successfully"
     else
@@ -337,26 +539,50 @@ install_apps() {
     if [ "$INSTALL_APPS" = true ]; then
         print_section "Installing Applications"
         
-        # Check if we're on Arch Linux or Debian/Ubuntu
-        if command -v pacman &> /dev/null; then
-            # Arch Linux - install common applications
-            pacman -S --needed --noconfirm \
-                firefox \
-                thunderbird \
-                gparted \
-                gimp \
-                vlc \
-                libreoffice-fresh
-        elif command -v apt-get &> /dev/null; then
-            # Debian/Ubuntu - install common applications
-            apt-get install -y \
-                firefox \
-                thunderbird \
-                gparted \
-                gimp \
-                vlc \
-                libreoffice
-        fi
+        local distro=$(detect_distro)
+        
+        case $distro in
+            "arch")
+                pacman -Sy --needed --noconfirm \
+                    firefox \
+                    thunderbird \
+                    gparted \
+                    gimp \
+                    vlc \
+                    libreoffice-fresh
+                ;;
+                
+            "debian"|"ubuntu")
+                apt-get update
+                apt-get install -y \
+                    firefox \
+                    thunderbird \
+                    gparted \
+                    gimp \
+                    vlc \
+                    libreoffice
+                ;;
+                
+            "fedora"|"redhat")
+                dnf install -y \
+                    firefox \
+                    thunderbird \
+                    gparted \
+                    gimp \
+                    vlc \
+                    libreoffice
+                ;;
+                
+            "suse")
+                zypper install -y \
+                    MozillaFirefox \
+                    MozillaThunderbird \
+                    gparted \
+                    gimp \
+                    vlc \
+                    libreoffice
+                ;;
+        esac
         
         print_status "Applications installed successfully"
     else
@@ -371,6 +597,10 @@ main() {
     # Check prerequisites
     check_root
     check_uefi
+    
+    # Detect distribution
+    local distro=$(detect_distro)
+    print_status "Detected distribution: $distro"
     
     # Install components
     install_refind
