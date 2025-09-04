@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Secure Boot Installation Script with rEFInd
-# Based on RyanTheTide's LinuxConfigurations with Secure Boot support
-
-set -e
+# Secure Boot Configuration
+SECURE_BOOT=true
+SHIM_VERSION="0.9"
+MOKUTIL_VERSION="0.3.0"
 
 # Colors for output
 RED='\033[0;31m'
@@ -12,517 +12,177 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Logging functions
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
-
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-# Variables
-TARGET_DISK=""
-EFI_PARTITION=""
-ROOT_PARTITION=""
-SWAP_PARTITION=""
-USERNAME=""
-HOSTNAME=""
-TIMEZONE="America/New_York"
-LANGUAGE="en_US.UTF-8"
-KEY_DIR="/root/secureboot_keys"
-
-# Check if running as root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root"
-        exit 1
+# Function to check if secure boot is enabled
+check_secure_boot() {
+    if [ -d /sys/firmware/efi ] && [ -f /sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data ]; then
+        local secure_boot_status=$(od -An -t u1 /sys/firmware/efi/vars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c/data)
+        if [ "$secure_boot_status" -eq 1 ]; then
+            echo -e "${GREEN}Secure Boot is enabled${NC}"
+            return 0
+        else
+            echo -e "${YELLOW}Secure Boot is disabled${NC}"
+            return 1
+        fi
+    else
+        echo -e "${YELLOW}Not running on UEFI system or cannot determine Secure Boot status${NC}"
+        return 2
     fi
 }
 
-# Check if UEFI is being used
-check_uefi() {
-    if [[ ! -d /sys/firmware/efi ]]; then
-        log_error "This system does not appear to be using UEFI firmware. Secure Boot requires UEFI."
-        exit 1
-    fi
-}
-
-# Get target disk
-get_target_disk() {
-    log_info "Available disks:"
-    lsblk -d -o NAME,SIZE,MODEL
-    echo ""
-    read -p "Enter the target disk (e.g., sda, nvme0n1): " TARGET_DISK
-    TARGET_DISK="/dev/${TARGET_DISK}"
+# Function to install secure boot dependencies
+install_secure_boot_deps() {
+    echo -e "${BLUE}Installing Secure Boot dependencies...${NC}"
     
-    if [[ ! -b "$TARGET_DISK" ]]; then
-        log_error "Disk $TARGET_DISK does not exist"
-        exit 1
+    # Check if we're on Arch Linux or Debian/Ubuntu
+    if command -v pacman &> /dev/null; then
+        # Arch Linux
+        sudo pacman -S --needed --noconfirm shim-signed sbsigntools efibootmgr mokutil
+    elif command -v apt-get &> /dev/null; then
+        # Debian/Ubuntu
+        sudo apt-get update
+        sudo apt-get install -y shim-signed sbsigntools efibootmgr mokutil
+    else
+        echo -e "${RED}Unsupported distribution for automatic Secure Boot setup${NC}"
+        return 1
     fi
+    
+    return 0
 }
 
-# Partition the disk
-partition_disk() {
-    log_info "Partitioning disk $TARGET_DISK"
+# Function to setup shim and MOK
+setup_shim_and_mok() {
+    echo -e "${BLUE}Setting up Shim and Machine Owner Key (MOK)...${NC}"
     
-    # Check if disk already has partitions
-    if [[ $(lsblk -n -o NAME "$TARGET_DISK" | wc -l) -gt 1 ]]; then
-        log_warning "Disk $TARGET_DISK already has partitions"
-        read -p "Do you want to overwrite them? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log_error "Aborting installation"
-            exit 1
+    local esp_mount="/boot/efi"
+    local refind_dir="$esp_mount/EFI/refind"
+    
+    # Copy shim to ESP
+    if [ -f "/usr/share/shim-signed/shimx64.efi" ]; then
+        sudo cp "/usr/share/shim-signed/shimx64.efi" "$esp_mount/EFI/BOOT/BOOTX64.EFI"
+        sudo cp "/usr/share/shim-signed/shimx64.efi" "$refind_dir/shimx64.efi"
+    fi
+    
+    # Copy MokManager
+    if [ -f "/usr/share/shim-signed/mmx64.efi" ]; then
+        sudo cp "/usr/share/shim-signed/mmx64.efi" "$esp_mount/EFI/BOOT/"
+        sudo cp "/usr/share/shim-signed/mmx64.efi" "$refind_dir/"
+    fi
+    
+    # Sign rEFInd with your key (if you have one) or use shim's built-in validation
+    if command -v sbsign &> /dev/null; then
+        # This assumes you have a key - for initial setup, shim will handle this
+        if [ -f "$refind_dir/refind_x64.efi" ]; then
+            echo -e "${YELLOW}Note: For full Secure Boot, you should sign rEFInd with your own keys${NC}"
+            echo -e "${YELLOW}See: https://www.rodsbooks.com/refind/secureboot.html${NC}"
         fi
     fi
     
-    # Create GPT partition table
-    parted -s "$TARGET_DISK" mklabel gpt
-    
-    # Create partitions
-    # EFI partition (500MB)
-    parted -s "$TARGET_DISK" mkpart primary fat32 1MiB 501MiB
-    parted -s "$TARGET_DISK" set 1 esp on
-    EFI_PARTITION="${TARGET_DISK}1"
-    if [[ "$TARGET_DISK" == *"nvme"* ]]; then
-        EFI_PARTITION="${TARGET_DISK}p1"
-    fi
-    
-    # Swap partition (size based on RAM)
-    RAM_SIZE=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    SWAP_SIZE=$((RAM_SIZE / 1000 + 1000)) # RAM size in GB + 1GB
-    parted -s "$TARGET_DISK" mkpart primary linux-swap 501MiB ${SWAP_SIZE}MiB
-    SWAP_PARTITION="${TARGET_DISK}2"
-    if [[ "$TARGET_DISK" == *"nvme"* ]]; then
-        SWAP_PARTITION="${TARGET_DISK}p2"
-    fi
-    
-    # Root partition (rest of disk)
-    parted -s "$TARGET_DISK" mkpart primary ext4 ${SWAP_SIZE}MiB 100%
-    ROOT_PARTITION="${TARGET_DISK}3"
-    if [[ "$TARGET_DISK" == *"nvme"* ]]; then
-        ROOT_PARTITION="${TARGET_DISK}p3"
-    fi
-    
-    log_success "Disk partitioned successfully"
-}
-
-# Format partitions
-format_partitions() {
-    log_info "Formatting partitions"
-    
-    # Format EFI partition
-    mkfs.fat -F32 "$EFI_PARTITION"
-    
-    # Format swap partition
-    mkswap "$SWAP_PARTITION"
-    swapon "$SWAP_PARTITION"
-    
-    # Format root partition
-    mkfs.ext4 "$ROOT_PARTITION"
-    
-    # Mount partitions
-    mount "$ROOT_PARTITION" /mnt
-    mkdir -p /mnt/boot/efi
-    mount "$EFI_PARTITION" /mnt/boot/efi
-    
-    log_success "Partitions formatted and mounted"
-}
-
-# Install base system
-install_base_system() {
-    log_info "Installing base system"
-    
-    # Update mirrorlist
-    pacman -Sy --noconfirm reflector
-    reflector --country US --latest 10 --sort rate --save /etc/pacman.d/mirrorlist
-    
-    # Install base system
-    pacstrap /mnt base base-devel linux linux-firmware
-    
-    # Generate fstab
-    genfstab -U /mnt >> /mnt/etc/fstab
-    
-    log_success "Base system installed"
-}
-
-# Install required packages for Secure Boot
-install_secure_boot_packages() {
-    log_info "Installing Secure Boot packages..."
-    
-    arch-chroot /mnt /bin/bash <<EOF
-    pacman -Sy --noconfirm sbsigntools efitools
+    # Create shim configuration
+    local shim_config="$refind_dir/shim.conf"
+    sudo tee "$shim_config" > /dev/null << EOF
+# Shim configuration for rEFInd
+default_efi=EFI/refind/refind_x64.efi
+timeout=5
+verbose
 EOF
-    
-    log_success "Secure Boot packages installed"
-}
 
-# Generate keys for Secure Boot (in live environment)
-generate_secure_boot_keys() {
-    log_info "Generating Secure Boot keys..."
-    
-    # Create directory for keys
-    mkdir -p "$KEY_DIR"
-    
-    # Generate Platform Key (PK)
-    openssl req -newkey rsa:4096 -nodes -keyout "${KEY_DIR}/PK.key" \
-        -new -x509 -sha256 -days 3650 -out "${KEY_DIR}/PK.crt" \
-        -subj "/CN=Platform Key/"
-    
-    # Generate Key Exchange Key (KEK)
-    openssl req -newkey rsa:4096 -nodes -keyout "${KEY_DIR}/KEK.key" \
-        -new -x509 -sha256 -days 3650 -out "${KEY_DIR}/KEK.crt" \
-        -subj "/CN=Key Exchange Key/"
-    
-    # Generate Signature Database (db) key
-    openssl req -newkey rsa:4096 -nodes -keyout "${KEY_DIR}/db.key" \
-        -new -x509 -sha256 -days 3650 -out "${KEY_DIR}/db.crt" \
-        -subj "/CN=Signature Database key/"
-    
-    # Copy keys to installed system
-    mkdir -p /mnt/etc/secureboot/keys
-    cp -r "$KEY_DIR"/* /mnt/etc/secureboot/keys/
-    
-    log_success "Secure Boot keys generated and copied to installed system"
-}
-
-# Convert and sign ESL files
-convert_and_sign_esl() {
-    log_info "Converting and signing ESL files..."
-    
-    # Copy certificates to installed system for conversion
-    cp -r "$KEY_DIR" /mnt/tmp/secureboot_keys
-    
-    arch-chroot /mnt /bin/bash <<EOF
-    key_dir="/tmp/secureboot_keys"
-    
-    # Convert certificates to ESL format
-    cert-to-efi-sig-list -g "\$(uuidgen)" "\${key_dir}/PK.crt" "\${key_dir}/PK.esl"
-    cert-to-efi-sig-list -g "\$(uuidgen)" "\${key_dir}/KEK.crt" "\${key_dir}/KEK.esl"
-    cert-to-efi-sig-list -g "\$(uuidgen)" "\${key_dir}/db.crt" "\${key_dir}/db.esl"
-    
-    # Sign the ESL files
-    sign-efi-sig-list -g "\$(uuidgen)" -k "\${key_dir}/PK.key" -c "\${key_dir}/PK.crt" PK "\${key_dir}/PK.esl"
-    sign-efi-sig-list -g "\$(uuidgen)" -k "\${key_dir}/PK.key" -c "\${key_dir}/PK.crt" KEK "\${key_dir}/KEK.esl"
-    sign-efi-sig-list -g "\$(uuidgen)" -k "\${key_dir}/PK.key" -c "\${key_dir}/PK.crt" db "\${key_dir}/db.esl"
-    
-    # Copy auth files to permanent location
-    mkdir -p /etc/secureboot/keys
-    cp "\${key_dir}"/*.auth /etc/secureboot/keys/
-    
-    # Copy auth files to EFI partition
-    mkdir -p /boot/efi/EFI/keys
-    cp "\${key_dir}"/*.auth /boot/efi/EFI/keys/
-EOF
-    
-    log_success "ESL files converted and signed"
-}
-
-# Sign EFI binaries
-sign_efi_binaries() {
-    log_info "Signing EFI binaries..."
-    
-    arch-chroot /mnt /bin/bash <<EOF
-    key_dir="/etc/secureboot/keys"
-    efi_dir="/boot/efi"
-    
-    # Sign rEFInd
-    if [[ -f "\${efi_dir}/EFI/refind/refind_x64.efi" ]]; then
-        sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
-            --output "\${efi_dir}/EFI/refind/refind_x64.efi" "\${efi_dir}/EFI/refind/refind_x64.efi"
+    # Update refind.conf to work with shim
+    local refind_conf="$refind_dir/refind.conf"
+    if [ -f "$refind_conf" ]; then
+        # Backup original config
+        sudo cp "$refind_conf" "$refind_conf.backup.$(date +%Y%m%d)"
+        
+        # Ensure no duplicate entries
+        sudo sed -i '/use_nvram/d' "$refind_conf"
+        sudo sed -i '/use_graphics_for/d' "$refind_conf"
+        
+        # Add secure boot compatible settings
+        echo "use_nvram false" | sudo tee -a "$refind_conf" > /dev/null
+        echo "use_graphics_for linux,android" | sudo tee -a "$refind_conf" > /dev/null
     fi
     
-    # Sign the kernel
-    for kernel in /boot/vmlinuz-*; do
-        if [[ -f "\$kernel" ]]; then
-            sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
-                --output "\$kernel" "\$kernel"
-        fi
-    done
-    
-    # Sign the bootloader
-    if [[ -f "\${efi_dir}/EFI/BOOT/BOOTX64.EFI" ]]; then
-        sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
-            --output "\${efi_dir}/EFI/BOOT/BOOTX64.EFI" "\${efi_dir}/EFI/BOOT/BOOTX64.EFI"
-    fi
-EOF
-    
-    log_success "EFI binaries signed"
+    return 0
 }
 
-# Setup automatic signing for future kernel updates
-setup_automatic_signing() {
-    log_info "Setting up automatic signing for future kernel updates..."
+# Function to enroll MOK
+enroll_mok() {
+    echo -e "${BLUE}Setting up Machine Owner Key enrollment...${NC}"
     
-    arch-chroot /mnt /bin/bash <<EOF
-    key_dir="/etc/secureboot/keys"
+    # This would typically be done manually after reboot
+    echo -e "${YELLOW}After reboot, you will need to:${NC}"
+    echo -e "${YELLOW}1. Enter UEFI setup and enable Secure Boot${NC}"
+    echo -e "${YELLOW}2. On first boot with Secure Boot, MokManager will appear${NC}"
+    echo -e "${YELLOW}3. Follow prompts to enroll your keys${NC}"
+    echo -e "${YELLOW}4. Select 'Enroll key from disk' and choose your key${NC}"
     
-    # Create a hook for package managers to sign kernels
-    hook_dir="/etc/pacman.d/hooks"
-    hook_file="\${hook_dir}/999-sign-kernel-for-secureboot.hook"
-    
-    mkdir -p "\$hook_dir"
-    cat > "\$hook_file" << HOOK_EOF
-[Trigger]
-Operation = Install
-Operation = Upgrade
-Type = Package
-Target = linux
-Target = linux-*
-Target = systemd
-Target = systemd-*
-Target = efi-*
-
-[Action]
-Description = Signing EFI binaries for Secure Boot
-When = PostTransaction
-Exec = /usr/bin/sh -c '/usr/bin/find /boot -name "vmlinuz-*" -exec /usr/bin/sbsign --key \$key_dir/db.key --cert \$key_dir/db.crt --output {} {} \;'
-Exec = /usr/bin/sh -c '/usr/bin/sbsign --key \$key_dir/db.key --cert \$key_dir/db.crt --output /boot/efi/EFI/refind/refind_x64.efi /boot/efi/EFI/refind/refind_x64.efi'
-HOOK_EOF
-
-    # Create a script for signing
-    cat > /usr/local/bin/sign-efi-binaries << SCRIPT_EOF
+    # Create a reminder script for post-install
+    local reminder_script="/tmp/secure_boot_reminder.sh"
+    cat > "$reminder_script" << EOF
 #!/bin/bash
-key_dir="/etc/secureboot/keys"
-efi_dir="/boot/efi"
-
-# Sign rEFInd
-if [[ -f "\${efi_dir}/EFI/refind/refind_x64.efi" ]]; then
-    sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
-        --output "\${efi_dir}/EFI/refind/refind_x64.efi" "\${efi_dir}/EFI/refind/refind_x64.efi"
-fi
-
-# Sign the kernel
-for kernel in /boot/vmlinuz-*; do
-    if [[ -f "\$kernel" ]]; then
-        sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
-            --output "\$kernel" "\$kernel"
-    fi
-done
-
-# Sign the bootloader
-if [[ -f "\${efi_dir}/EFI/BOOT/BOOTX64.EFI" ]]; then
-    sbsign --key "\${key_dir}/db.key" --cert "\${key_dir}/db.crt" \
-        --output "\${efi_dir}/EFI/BOOT/BOOTX64.EFI" "\${efi_dir}/EFI/BOOT/BOOTX64.EFI"
-fi
-SCRIPT_EOF
-
-    chmod +x /usr/local/bin/sign-efi-binaries
+echo "Secure Boot Setup Instructions:"
+echo "1. Reboot and enter UEFI/BIOS setup (usually F2, Del, or F10)"
+echo "2. Enable Secure Boot mode"
+echo "3. Save changes and exit"
+echo "4. On boot, MokManager should appear - follow prompts to enroll keys"
+echo "5. For rEFInd, you may need to enroll the rEFInd key if not using shim"
 EOF
     
-    log_success "Automatic signing setup complete"
+    chmod +x "$reminder_script"
+    echo -e "${GREEN}Secure Boot setup instructions saved to: $reminder_script${NC}"
 }
 
-# Configure system
-configure_system() {
-    log_info "Configuring system"
-    
-    # Chroot into the new system
-    arch-chroot /mnt /bin/bash <<EOF
-    # Set timezone
-    ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
-    hwclock --systohc
-    
-    # Localization
-    echo "$LANGUAGE UTF-8" >> /etc/locale.gen
-    locale-gen
-    echo "LANG=$LANGUAGE" > /etc/locale.conf
-    
-    # Network configuration
-    echo "$HOSTNAME" > /etc/hostname
-    cat > /etc/hosts << HOSTS_EOF
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
-HOSTS_EOF
-    
-    # Set root password
-    echo "Setting root password:"
-    passwd
-    
-    # Install additional packages
-    pacman -Sy --noconfirm \
-        sudo nano vim git curl wget openssh \
-        networkmanager network-manager-applet \
-        dialog mtools dosfstools \
-        refind-efi efibootmgr
-    
-    # Enable services
-    systemctl enable NetworkManager
-    
-    # Create user
-    useradd -m -G wheel -s /bin/bash "$USERNAME"
-    echo "Setting password for $USERNAME:"
-    passwd "$USERNAME"
-    
-    # Configure sudo
-    echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
-    
-    # Install and configure rEFInd
-    refind-install
-    
-    # Create rEFInd config directory if it doesn't exist
-    mkdir -p /boot/efi/EFI/refind/
-    
-    # Get root partition UUID
-    ROOT_UUID=\$(blkid -s UUID -o value $ROOT_PARTITION)
-    
-    # Configure rEFInd
-    cat > /boot/efi/EFI/refind/refind.conf << REFIND_EOF
-timeout 5
-use_nvram false
-scan_all_linux_kernels true
-also_scan_dirs @/EFI/ubuntu,@/EFI/BOOT
-fold_linux_kernels false
-menuentry "Arch Linux" {
-    icon     /EFI/refind/icons/os_arch.png
-    volume   "Arch Linux"
-    loader   /vmlinuz-linux
-    initrd   /initramfs-linux.img
-    options  "root=UUID=\$ROOT_UUID rw"
-}
-menuentry "Windows Boot Manager" {
-    icon     /EFI/refind/icons/os_win.png
-    volume   "Windows Boot Manager"
-    loader   /EFI/Microsoft/Boot/bootmgfw.efi
-}
-REFIND_EOF
-    
-    # Generate initramfs
-    mkinitcpio -P
-    
-    # Install microcode
-    if grep -q "Intel" /proc/cpuinfo; then
-        pacman -S --noconfirm intel-ucode
-    elif grep -q "AMD" /proc/cpuinfo; then
-        pacman -S --noconfirm amd-ucode
-    fi
-    
-    # Update rEFInd config with microcode
-    if [ -f /boot/intel-ucode.img ]; then
-        sed -i 's/initrd   \/initramfs-linux.img/initrd   \/intel-ucode.img\n    initrd   \/initramfs-linux.img/' /boot/efi/EFI/refind/refind.conf
-    elif [ -f /boot/amd-ucode.img ]; then
-        sed -i 's/initrd   \/initramfs-linux.img/initrd   \/amd-ucode.img\n    initrd   \/initramfs-linux.img/' /boot/efi/EFI/refind/refind.conf
-    fi
-EOF
-    
-    log_success "System configured"
-}
-
-# Install desktop environment
-install_desktop() {
-    log_info "Installing desktop environment"
-    
-    arch-chroot /mnt /bin/bash <<EOF
-    # Install KDE Plasma
-    pacman -Sy --noconfirm \
-        plasma-meta plasma-desktop sddm \
-        konsole dolphin kate \
-        firefox vlc \
-        noto-fonts noto-fonts-cjk noto-fonts-emoji \
-        ttf-dejavu ttf-liberation
-    
-    # Enable display manager
-    systemctl enable sddm
-    
-    # Install additional applications
-    pacman -Sy --noconfirm \
-        libreoffice-still gimp inkscape \
-        audacity handbrake
-EOF
-    
-    log_success "Desktop environment installed"
-}
-
-# Main Secure Boot setup function
+# Function to check and setup secure boot
 setup_secure_boot() {
-    log_info "Starting Secure Boot setup..."
-    
-    check_uefi
-    
-    install_secure_boot_packages
-    generate_secure_boot_keys
-    convert_and_sign_esl
-    sign_efi_binaries
-    setup_automatic_signing
-    
-    log_success "Secure Boot setup complete!"
-    log_warning "You need to enroll the keys in your UEFI firmware to enable Secure Boot"
-    log_info "The keys are located in: /etc/secureboot/keys/"
-    log_info "You need to copy the .auth files to a USB drive and enroll them in your BIOS"
+    if [ "$SECURE_BOOT" = true ]; then
+        echo -e "${BLUE}Checking Secure Boot status...${NC}"
+        
+        check_secure_boot
+        local secure_boot_status=$?
+        
+        if [ $secure_boot_status -eq 0 ]; then
+            echo -e "${GREEN}Secure Boot is already enabled${NC}"
+        else
+            echo -e "${YELLOW}Setting up Secure Boot components...${NC}"
+            
+            install_secure_boot_deps
+            if [ $? -eq 0 ]; then
+                setup_shim_and_mok
+                enroll_mok
+                
+                echo -e "${GREEN}Secure Boot components installed successfully${NC}"
+                echo -e "${YELLOW}Remember to enable Secure Boot in your UEFI settings after reboot${NC}"
+            else
+                echo -e "${RED}Failed to install Secure Boot dependencies${NC}"
+            fi
+        fi
+    else
+        echo -e "${YELLOW}Secure Boot setup skipped (SECURE_BOOT=false)${NC}"
+    fi
 }
 
-# Get user input
-get_user_input() {
-    echo ""
-    log_info "Arch Linux Installation with Secure Boot and rEFInd"
-    echo ""
+# Main execution
+main() {
+    echo -e "${BLUE}Starting Secure Boot setup...${NC}"
     
-    get_target_disk
-    
-    read -p "Enter username: " USERNAME
-    read -p "Enter hostname: " HOSTNAME
-    
-    echo ""
-    log_info "The following partitions will be created:"
-    log_info "1. EFI System Partition (500MB)"
-    log_info "2. Swap Partition (size based on RAM + 1GB)"
-    log_info "3. Root Partition (remaining space)"
-    echo ""
-    
-    read -p "Continue with installation? (y/N): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        log_error "Installation aborted by user"
+    # Check if running as root
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}Please run as root${NC}"
         exit 1
     fi
-}
-
-# Main installation function
-main_installation() {
-    check_root
-    get_user_input
     
-    log_info "Starting installation process..."
+    # Check if UEFI
+    if [ ! -d /sys/firmware/efi ]; then
+        echo -e "${RED}This system does not appear to be using UEFI${NC}"
+        echo -e "${RED}Secure Boot requires UEFI firmware${NC}"
+        exit 1
+    fi
     
-    # Installation steps
-    partition_disk
-    format_partitions
-    install_base_system
-    configure_system
-    install_desktop
-    
-    # Secure Boot setup
+    # Setup secure boot
     setup_secure_boot
     
-    # Cleanup and final steps
-    log_info "Finalizing installation..."
-    umount -R /mnt
-    swapoff "$SWAP_PARTITION"
-    
-    log_success "Installation complete!"
-    log_info "You can now reboot into your new system"
-    log_warning "Don't forget to:"
-    log_warning "1. Remove the installation media"
-    log_warning "2. Enable Secure Boot in your BIOS/UEFI settings"
-    log_warning "3. Enroll your Secure Boot keys from /etc/secureboot/keys/"
+    echo -e "${GREEN}Secure Boot setup completed${NC}"
+    echo -e "${YELLOW}Please reboot and complete the MOK enrollment process${NC}"
 }
 
-# Check if we're running on a live system
-if grep -q "Arch Linux" /etc/os-release 2>/dev/null; then
-    # We're on a live Arch system, proceed with installation
-    main_installation
-else
-    log_error "This script must be run from an Arch Linux live environment"
-    log_info "Please boot from an Arch Linux ISO and run this script"
-    exit 1
-fi
+# Run main function
+main "$@"
